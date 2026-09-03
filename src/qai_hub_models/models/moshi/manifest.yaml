@@ -1,0 +1,32 @@
+applicable_scenarios:
+- Accessibility
+- Smart Home
+description: Moshi is Kyutai's real-time spoken dialogue model. This recipe exposes explicit Mimi codec, temporal transformer, DepFormer, and decoder components for fixed-shape float export.
+domain: Audio
+default_device: Samsung Galaxy S25 (Family)
+form_factors:
+- Phone
+- Tablet
+- IoT
+has_animated_banner: false
+has_static_banner: false
+headline: Fixed-shape float components for Kyutai Moshi spoken dialogue generation.
+id: moshi
+is_collection_model: true
+license: https://github.com/kyutai-labs/moshi/blob/main/moshi/LICENSE
+license_type: mit
+name: Moshi
+related_models:
+- whisper_small
+requires_aot_prepare: true
+source_repo: https://github.com/kyutai-labs/moshi
+status: pending
+supported_precisions:
+- float
+tags:
+- foundation
+- generative-ai
+templates:
+- moshi
+use_case: Audio Generation
+voice_ai_sdk: tts

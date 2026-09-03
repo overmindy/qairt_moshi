@@ -1,0 +1,13 @@
+external_repos:
+  moshi:
+    commit_sha: e6a55d2722a65870ef52a6c9f6ecfc0e90f38362
+    repo_url: https://github.com/kyutai-labs/moshi.git
+description: Shared static graph wrappers for the Kyutai Moshi architecture.
+domain: Audio
+headline: Shared Kyutai Moshi model components.
+id: moshi_template
+license: https://github.com/kyutai-labs/moshi/blob/main/moshi/LICENSE
+license_type: mit
+name: Moshi-Template
+source_repo: https://github.com/kyutai-labs/moshi
+use_case: Audio Generation
