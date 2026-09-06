@@ -4,6 +4,9 @@
 # ---------------------------------------------------------------------
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import torch
 from torch import nn
 from typing_extensions import Self
@@ -25,6 +28,9 @@ from qai_hub_models.utils.input_spec import InputSpec, OutputSpec, TensorSpec
 FRAME_SAMPLES = 1920
 CODEBOOKS = 8
 DEFAULT_HF_REPO = "kyutai/moshiko-pytorch-bf16"
+MODEL_WEIGHTS_NAME = "model.safetensors"
+MIMI_WEIGHTS_NAME = "tokenizer-e351c8d8-checkpoint125.safetensors"
+TOKENIZER_NAME = "tokenizer_spm_32k_3.model"
 
 
 class _StaticComponent(PytorchWorkbenchModel):
@@ -112,7 +118,47 @@ class MimiDecoder(_StaticComponent):
 
 def load_moshi_models(
     hf_repo: str = DEFAULT_HF_REPO,
+    model_dir: str | Path | None = None,
+    device: str = "cpu",
+    dtype: torch.dtype = torch.bfloat16,
 ) -> tuple[MimiModel, LMModel, MimiModel]:
-    checkpoint = CheckpointInfo.from_hf_repo(hf_repo)
-    mimi = checkpoint.get_mimi()
-    return mimi, checkpoint.get_moshi(dtype=torch.bfloat16), mimi
+    if model_dir is None:
+        checkpoint = CheckpointInfo.from_hf_repo(hf_repo)
+    else:
+        model_path = Path(model_dir).expanduser().resolve()
+        if not model_path.is_dir():
+            raise FileNotFoundError(f"Moshi model directory does not exist: {model_path}")
+        config_path = model_path / "config.json"
+        config = json.loads(config_path.read_text()) if config_path.is_file() else {}
+        moshi_weights = model_path / config.get("moshi_name", MODEL_WEIGHTS_NAME)
+        mimi_weights = model_path / config.get("mimi_name", MIMI_WEIGHTS_NAME)
+        tokenizer = model_path / config.get("tokenizer_name", TOKENIZER_NAME)
+        required_paths = [moshi_weights, mimi_weights, tokenizer]
+        missing = [str(path) for path in required_paths if not path.is_file()]
+        if missing:
+            raise FileNotFoundError(f"Missing files in local Moshi directory: {', '.join(missing)}")
+        if not config_path.is_file():
+            checkpoint = CheckpointInfo(moshi_weights, mimi_weights, tokenizer)
+        else:
+            mimi_config_name = config.get("mimi_config_name")
+            mimi_config_path = model_path / mimi_config_name if mimi_config_name else None
+            lora_name = config.get("lora_name")
+            lora_path = model_path / lora_name if lora_name else None
+            optional_paths = [path for path in (mimi_config_path, lora_path) if path]
+            missing_optional = [str(path) for path in optional_paths if not path.is_file()]
+            if missing_optional:
+                raise FileNotFoundError(
+                    "Missing files referenced by config.json: "
+                    + ", ".join(missing_optional)
+                )
+            checkpoint = CheckpointInfo.from_hf_repo(
+                hf_repo,
+                moshi_weights=moshi_weights,
+                mimi_weights=mimi_weights,
+                tokenizer=tokenizer,
+                config_path=config_path,
+                mimi_config_path=mimi_config_path,
+                lora_weights=lora_path,
+            )
+    mimi = checkpoint.get_mimi(device=device)
+    return mimi, checkpoint.get_moshi(device=device, dtype=dtype), mimi

@@ -26,7 +26,12 @@ class MoshiApp:
 
     def predict(self, audio: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         user_codes = self.encoder(audio)
-        text = torch.full((audio.shape[0], 1, 1), 3, dtype=torch.int32)
+        text = torch.full(
+            (audio.shape[0], 1, 1),
+            3,
+            dtype=torch.int32,
+            device=audio.device,
+        )
         response_context = torch.zeros_like(user_codes)
         sequence = torch.cat((text, response_context, user_codes), dim=1)
         temporal, text_logits = self.temporal(sequence)

@@ -61,6 +61,28 @@ Only run this on a Linux host with enough RAM and swap. It loads the real Moshik
 python scripts/moshi_experiment.py --run-real --hf-repo kyutai/moshiko-pytorch-bf16
 ```
 
+For an already downloaded local snapshot, specify both its directory and GPU:
+
+```bash
+python scripts/moshi_experiment.py \
+  --run-real \
+  --model-dir /data/models/moshiko-pytorch-bf16 \
+  --device cuda:0 \
+  --dtype bfloat16
+```
+
+The directory must contain `model.safetensors`, `tokenizer-e351c8d8-checkpoint125.safetensors`, and `tokenizer_spm_32k_3.model`. If it contains `config.json`, any filenames referenced by that configuration must also exist in the directory. Local-directory mode does not download missing files.
+
+To expose only one physical GPU to the process, use `CUDA_VISIBLE_DEVICES`. The visible GPU is then numbered from zero inside the process:
+
+```bash
+CUDA_VISIBLE_DEVICES=1 python scripts/moshi_experiment.py \
+  --run-real \
+  --model-dir /data/models/moshiko-pytorch-bf16 \
+  --device cuda:0 \
+  --dtype bfloat16
+```
+
 Use one process, no pytest-xdist, and no parallel export jobs. Capture the complete output:
 
 ```bash

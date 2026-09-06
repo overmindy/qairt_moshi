@@ -4,6 +4,9 @@
 # ---------------------------------------------------------------------
 from __future__ import annotations
 
+from pathlib import Path
+
+import torch
 from typing_extensions import Self
 
 from qai_hub_models.models.templates.moshi.model import (
@@ -29,9 +32,18 @@ class Moshi(WorkbenchModelCollection):
         super().__init__({"encoder": encoder, "temporal": temporal, "depformer": depformer, "decoder": decoder})
 
     @classmethod
-    def from_pretrained(cls, hf_repo: str | None = None) -> Self:
+    def from_pretrained(
+        cls,
+        hf_repo: str = "kyutai/moshiko-pytorch-bf16",
+        model_dir: str | Path | None = None,
+        device: str = "cpu",
+        dtype: torch.dtype = torch.bfloat16,
+    ) -> Self:
         mimi_encoder, lm, mimi_decoder = load_moshi_models(
-            hf_repo or "kyutai/moshiko-pytorch-bf16"
+            hf_repo=hf_repo,
+            model_dir=model_dir,
+            device=device,
+            dtype=dtype,
         )
         return cls(
             MimiEncoder(mimi_encoder),
