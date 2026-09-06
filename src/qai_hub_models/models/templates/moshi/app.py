@@ -61,30 +61,61 @@ class MoshiStreamingApp:
     def run(self, audio: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
         if audio.ndim != 3 or audio.shape[1] != 1 or audio.shape[-1] % 1920:
             raise ValueError("audio must be [B, 1, frames*1920]")
+
         codes = self.mimi.encode(audio)
         self._text_logits.clear()
         self._depformer_logits.clear()
-        traces: dict[str, list[torch.Tensor]] = {"mimi_codes": [], "audio_codes": []}
-        traces["temporal_hidden"] = []
-        traces["text_logits"] = []
-        traces["depformer_logits"] = []
+
+        mimi_frames = []
+        audio_frames = []
+        temporal_frames = []
         waves = []
+
         with self.generator.streaming(audio.shape[0]):
             for frame in range(codes.shape[-1]):
                 user = codes[..., frame:frame + 1]
-                # LMGen accepts the user codebooks and owns generated streams/cache.
-                result, hidden = self.generator._step(user)
-                traces["mimi_codes"].append(user.detach().cpu())
-                if result is None:
+                step_result = self.generator._step(user)
+                mimi_frames.append(user.detach().cpu())
+
+                if step_result is None:
                     continue
-                traces["audio_codes"].append(result.detach().cpu())
-                traces["temporal_hidden"].append(hidden.detach().cpu())
-                waves.append(self.mimi.decode(result.to(codes.device)).detach().cpu())
-        def cat(name: str) -> torch.Tensor:
-            values = traces[name]
+
+                result, hidden = step_result
+                audio_frames.append(result.detach().cpu())
+                temporal_frames.append(hidden.detach().cpu())
+                waves.append(
+                    self.mimi.decode(result.to(codes.device)).detach().cpu()
+                )
+
+        def cat_frames(values):
             return torch.cat(values, dim=-1) if values else torch.empty(0)
-        trace = {name: cat(name) for name in traces}
-        trace["waveform"] = torch.cat(waves, dim=-1) if waves else torch.empty(0)
-        trace["text_logits"] = torch.cat(self._text_logits, dim=2) if self._text_logits else torch.empty(0)
-        trace["depformer_logits"] = torch.stack(self._depformer_logits, dim=2) if self._depformer_logits else torch.empty(0)
+
+        trace = {
+            "mimi_codes": cat_frames(mimi_frames),
+            "audio_codes": cat_frames(audio_frames),
+            "temporal_hidden": (
+                torch.cat(temporal_frames, dim=1)
+                if temporal_frames else torch.empty(0)
+            ),
+            "text_logits": (
+                torch.cat(self._text_logits, dim=2)
+                if self._text_logits else torch.empty(0)
+            ),
+            "depformer_logits": torch.empty(0),
+            "waveform": (
+                torch.cat(waves, dim=-1)
+                if waves else torch.empty(0)
+            ),
+        }
+        if self._depformer_logits:
+            depformer = torch.cat(self._depformer_logits, dim=2)
+            # The hook fires once per DepFormer codebook. Restore [B,T,Q,1,Card].
+            steps = depformer.shape[2]
+            codebooks = self.generator.lm_model.dep_q
+            if steps % codebooks:
+                raise RuntimeError(f"DepFormer trace steps {steps} not divisible by {codebooks}")
+            trace["depformer_logits"] = depformer.reshape(
+                depformer.shape[0], codebooks, steps // codebooks,
+                depformer.shape[3], depformer.shape[4]
+            ).transpose(1, 2).contiguous()
         return trace["waveform"], trace
