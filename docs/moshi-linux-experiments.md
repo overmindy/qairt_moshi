@@ -1,5 +1,35 @@
 # Moshi Linux Migration and Experiments
 
+## Explicit Temporal cache and first compiler artifact
+
+After collecting `temporal_sequence.pt`, run:
+
+```bash
+CUDA_VISIBLE_DEVICES=5 python scripts/moshi_export_temporal.py \
+  --model-dir /data2/liuguohong/moshiko-pytorch-bf16 \
+  --trace-dir /tmp/moshi-golden-replay --device cuda:0 \
+  --output-dir /tmp/moshi-temporal-export
+```
+
+Requires PyTorch and ONNX in the checkpoint environment. The implementation
+supports batch one, one token per call, unconditional Temporal layers and the
+original full cache capacity. Each layer receives `[2,1,KV_heads,capacity,head_dim]`
+K/V storage. `position` is an int64 tensor, drives RoPE and ring writes, and is
+returned incremented by the complete Temporal wrapper. No streaming contexts
+or Python cache objects are used by this wrapper's forward computation.
+
+The command checks all Temporal hidden states and text logits against the saved
+BF16 golden trace with zero tolerance. On mismatch it stops before export.
+On success it copies only the real first block to CPU FP32, exports
+`temporal_block_0.onnx` (opset 17), runs the ONNX checker, and saves
+`block_0_reference.pt`. This block includes normalization, QKV, RoPE, functional
+ring cache writes, attention, residuals and the feedforward network. It is a
+compiler compatibility probe, not a full Moshi model. FP32 ONNX runtime parity,
+cache wraparound parity, QAIRT conversion, HTP precision selection and target
+compilation remain unverified. The int64 position and ScatterElements operations
+may require converter-specific lowering. SDK version and target SoC must be
+established before selecting the local QAIRT conversion/compilation commands.
+
 This repository contains the Moshi recipe, but it does not contain the 18 GB Hugging Face checkpoint. Do not commit model weights, Hugging Face cache directories, generated binaries, or WAV files.
 
 ## 1. Push the branch from macOS
@@ -126,6 +156,7 @@ for every trace key:
 | Key | Layout | Time axis |
 | --- | --- | --- |
 | mimi_codes | B, 8, T | Input frames |
+| temporal_sequence | B, 17, T | Actual delay-processed LM inputs, including initial tokens |
 | temporal_hidden | B, T, D | Every LM step, including warmup |
 | text_logits | B, 1, T, text vocabulary | Every LM step, including warmup |
 | depformer_logits | B, T, 8, 1, audio vocabulary | Every LM step, sequential codebook order |
@@ -139,6 +170,14 @@ applies codebook-specific delays before returning output. Trace collection
 deliberately bypasses CUDA Graph wrappers so Python tensor capture executes on
 every step. These runs measure correctness, not production inference latency.
 Real checkpoint execution of this new entrypoint still needs Linux validation.
+
+Add `--verify-temporal-replay` to independently replay the saved Temporal inputs
+through `forward_text` in a fresh upstream streaming context, reusing the loaded
+weights. This checks exact hidden and text-logit equality for every frame and
+fails on any mismatch. It supports unconditioned checkpoints only. This is a
+module-boundary and state-reset check, not an explicit-cache implementation or
+an export parity test. The new sequence artifact includes the delayed text,
+generated audio, and user audio streams; Mimi codes alone cannot reconstruct it.
 
 ## 6. Updating the branch
 
