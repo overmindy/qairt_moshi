@@ -32,20 +32,29 @@ def main() -> None:
     if sequence.shape[0] != 1 or sequence.shape[-1] < 2:
         raise ValueError("Expected batch one and at least two saved Temporal steps")
     model = Moshi.from_pretrained(model_dir=args.model_dir, device=args.device)
-    temporal = ExplicitTemporal(model.components["temporal"].model).eval()
+    lm = model.components["temporal"].model
+    temporal = ExplicitTemporal(lm).eval()
     caches = [block.empty_cache() for block in temporal.blocks]
     position = torch.zeros(1, dtype=torch.int64, device=args.device)
     with no_compile():
+        reference = []
+        with lm.streaming(1):
+            for frame in range(sequence.shape[-1]):
+                hidden, logits = lm.forward_text(sequence[..., frame:frame + 1].to(args.device))
+                reference.append((hidden.cpu().clone(), logits.cpu().clone()))
+        print(f"device={torch.cuda.get_device_name(lm.device) if lm.device.type == 'cuda' else lm.device} torch={torch.__version__}")
         for frame in range(sequence.shape[-1]):
             hidden, logits, position, *caches = temporal(
                 sequence[..., frame:frame + 1].to(args.device), position, *caches
             )
-            for name, actual, expected in (
-                ("temporal_hidden", hidden.cpu(), trace["temporal_hidden"][:, frame:frame + 1]),
-                ("text_logits", logits.cpu(), trace["text_logits"][:, :, frame:frame + 1]),
+            for name, actual, expected, saved in (
+                ("temporal_hidden", hidden.cpu(), reference[frame][0], trace["temporal_hidden"][:, frame:frame + 1]),
+                ("text_logits", logits.cpu(), reference[frame][1], trace["text_logits"][:, :, frame:frame + 1]),
             ):
+                baseline_delta = (expected.float() - saved.float()).abs().max().item()
+                print(f"upstream-eager-vs-saved frame={frame} {name}: max_abs={baseline_delta:.8g}")
                 maximum = (actual.float() - expected.float()).abs().max().item()
-                print(f"explicit frame={frame} {name}: exact={torch.equal(actual, expected)} max_abs={maximum:.8g}")
+                print(f"explicit-vs-upstream-eager frame={frame} {name}: exact={torch.equal(actual, expected)} max_abs={maximum:.8g}")
                 torch.testing.assert_close(actual, expected, rtol=0, atol=0)
         print("Explicit Temporal cache parity: PASS")
         embedded = temporal.embed(sequence[..., :1].to(args.device)).cpu().float()
