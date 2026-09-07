@@ -102,6 +102,44 @@ python scripts/moshi_experiment.py --run-real --hf-repo kyutai/moshiko-pytorch-b
 
 The current recipe is not evidence that steps 4–8 have passed. In particular, it is not yet a complete streaming KV-cache runtime.
 
+### Multi-frame golden trace
+
+Run the real checkpoint with greedy generation and four silence frames:
+
+```bash
+CUDA_VISIBLE_DEVICES=7 python scripts/moshi_streaming_trace.py \
+  --model-dir /data2/liuguohong/moshiko-pytorch-bf16 \
+  --device cuda:0 --frames 4 --output-dir /tmp/moshi-golden
+```
+
+This is a structural streaming baseline, not an audio quality test or calibration
+dataset. Each input frame is 1920 mono samples at 24 kHz. Mimi and LMGen retain
+their streaming state throughout the run. The driver uses the pinned upstream
+LMGen delay handling and sequential DepFormer sampling. Only the eight audio
+channels of LMGen output are passed to Mimi; the leading text channel is saved
+separately. The driver requires more input frames than LMGen's maximum delay.
+It does not flush pending delayed frames after the input ends.
+
+The output directory contains input_audio.pt, waveform.wav, and a tensor file
+for every trace key:
+
+| Key | Layout | Time axis |
+| --- | --- | --- |
+| mimi_codes | B, 8, T | Input frames |
+| temporal_hidden | B, T, D | Every LM step, including warmup |
+| text_logits | B, 1, T, text vocabulary | Every LM step, including warmup |
+| depformer_logits | B, T, 8, 1, audio vocabulary | Every LM step, sequential codebook order |
+| text_tokens | B, 1, Tout | Delay-aligned output |
+| audio_codes | B, 8, Tout | Delay-aligned output |
+| waveform | B, 1, samples | Decoded output |
+
+Here Tout = T - max_delay for the default synchronous LMGen. The hidden state
+and logits at step t must not be naively paired with output frame t: LMGen
+applies codebook-specific delays before returning output. Trace collection
+deliberately bypasses CUDA Graph wrappers so Python tensor capture executes on
+every step. These runs measure correctness, not production inference latency.
+Real checkpoint execution of this new entrypoint still needs Linux validation.
+
 ## 6. Updating the branch
 
 ```bash

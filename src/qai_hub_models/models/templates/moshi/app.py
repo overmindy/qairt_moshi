@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from unittest.mock import patch
 
 import torch
 
@@ -53,16 +54,14 @@ class MoshiStreamingApp:
         self._depformer_logits = []
         self.generator = LMGen(
             lm, use_sampling=use_sampling,
-            on_text_logits_hook=lambda value: self._text_logits.append(value.detach().cpu()),
-            on_depformer_logits_hook=lambda value: self._depformer_logits.append(value.detach().cpu()),
+            on_text_logits_hook=lambda value: self._text_logits.append(value.detach().cpu().clone()),
         )
 
     @torch.no_grad()
     def run(self, audio: torch.Tensor) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
-        if audio.ndim != 3 or audio.shape[1] != 1 or audio.shape[-1] % 1920:
+        if audio.ndim != 3 or audio.shape[1] != 1 or not audio.shape[-1] or audio.shape[-1] % 1920:
             raise ValueError("audio must be [B, 1, frames*1920]")
 
-        codes = self.mimi.encode(audio)
         self._text_logits.clear()
         self._depformer_logits.clear()
 
@@ -70,21 +69,38 @@ class MoshiStreamingApp:
         audio_frames = []
         temporal_frames = []
         waves = []
+        text_frames = []
+        lm = self.generator.lm_model
+        forward_text = lm.forward_text
+        forward_depformer = lm.forward_depformer
 
-        with self.generator.streaming(audio.shape[0]):
-            for frame in range(codes.shape[-1]):
-                user = codes[..., frame:frame + 1]
+        def trace_text(*args, **kwargs):
+            hidden, logits = forward_text(*args, **kwargs)
+            temporal_frames.append(hidden.detach().cpu().clone())
+            return hidden, logits
+
+        def trace_depformer(*args, **kwargs):
+            logits = forward_depformer(*args, **kwargs)
+            self._depformer_logits.append(logits.detach().cpu().clone())
+            return logits
+
+        with self.mimi.streaming(audio.shape[0]), self.generator.streaming(audio.shape[0]), patch.object(lm, "forward_depformer", trace_depformer):
+            state = self.generator._streaming_state
+            state.graphed_main = trace_text
+            state.graphed_depth = self.generator.depformer_step
+            for frame in range(audio.shape[-1] // 1920):
+                user = self.mimi.encode(audio[..., frame * 1920:(frame + 1) * 1920])
                 step_result = self.generator._step(user)
-                mimi_frames.append(user.detach().cpu())
+                mimi_frames.append(user.detach().cpu().clone())
 
                 if step_result is None:
                     continue
 
-                result, hidden = step_result
-                audio_frames.append(result.detach().cpu())
-                temporal_frames.append(hidden.detach().cpu())
+                result, _ = step_result
+                text_frames.append(result[:, :1].detach().cpu().clone())
+                audio_frames.append(result[:, 1:].detach().cpu().clone())
                 waves.append(
-                    self.mimi.decode(result.to(codes.device)).detach().cpu()
+                    self.mimi.decode(result[:, 1:]).detach().cpu().clone()
                 )
 
         def cat_frames(values):
@@ -93,6 +109,7 @@ class MoshiStreamingApp:
         trace = {
             "mimi_codes": cat_frames(mimi_frames),
             "audio_codes": cat_frames(audio_frames),
+            "text_tokens": cat_frames(text_frames),
             "temporal_hidden": (
                 torch.cat(temporal_frames, dim=1)
                 if temporal_frames else torch.empty(0)
@@ -109,7 +126,6 @@ class MoshiStreamingApp:
         }
         if self._depformer_logits:
             depformer = torch.cat(self._depformer_logits, dim=2)
-            # The hook fires once per DepFormer codebook. Restore [B,T,Q,1,Card].
             steps = depformer.shape[2]
             codebooks = self.generator.lm_model.dep_q
             if steps % codebooks:
