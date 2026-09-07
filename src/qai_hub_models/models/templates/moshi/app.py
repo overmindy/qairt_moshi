@@ -115,7 +115,7 @@ class MoshiStreamingApp:
             if steps % codebooks:
                 raise RuntimeError(f"DepFormer trace steps {steps} not divisible by {codebooks}")
             trace["depformer_logits"] = depformer.reshape(
-                depformer.shape[0], codebooks, steps // codebooks,
-                depformer.shape[3], depformer.shape[4]
-            ).transpose(1, 2).contiguous()
+                depformer.shape[0], 1, steps // codebooks, codebooks,
+                depformer.shape[3]
+            ).permute(0, 2, 3, 1, 4).contiguous()
         return trace["waveform"], trace
