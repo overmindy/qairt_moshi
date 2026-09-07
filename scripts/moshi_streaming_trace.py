@@ -15,12 +15,37 @@ from qai_hub_models.models.moshi.model import Moshi
 from qai_hub_models.models.templates.moshi.app import MoshiStreamingApp
 
 
+@torch.no_grad()
+def verify_temporal_replay(lm, trace: dict[str, torch.Tensor]) -> None:
+    sequence = trace["temporal_sequence"]
+    failures = []
+    with lm.streaming(sequence.shape[0]):
+        for frame in range(sequence.shape[-1]):
+            hidden, logits = lm.forward_text(sequence[..., frame:frame + 1].to(lm.device))
+            for name, actual, expected in (
+                ("temporal_hidden", hidden, trace["temporal_hidden"][:, frame:frame + 1]),
+                ("text_logits", logits, trace["text_logits"][:, :, frame:frame + 1]),
+            ):
+                actual = actual.detach().cpu()
+                if actual.shape != expected.shape or actual.dtype != expected.dtype:
+                    raise RuntimeError(f"frame={frame} {name}: shape or dtype mismatch")
+                exact = torch.equal(actual, expected)
+                maximum = (actual.float() - expected.float()).abs().max().item()
+                print(f"replay frame={frame} {name}: exact={exact} max_abs={maximum:.8g}")
+                if not exact or not torch.isfinite(actual).all():
+                    failures.append((frame, name))
+    if failures:
+        raise RuntimeError(f"Temporal replay differed from golden trace: {failures}")
+    print("Temporal replay: PASS (fresh streaming state, all frames exact)")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--frames", type=int, default=4)
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument("--verify-temporal-replay", action="store_true")
     args = parser.parse_args()
     if args.frames < 1:
         raise SystemExit("--frames must be positive")
@@ -52,6 +77,8 @@ def main() -> None:
     print(f"frames={args.frames} output_dir={args.output_dir}")
     for name, value in trace.items():
         print(f"{name}_shape={tuple(value.shape)} dtype={value.dtype}")
+    if args.verify_temporal_replay:
+        verify_temporal_replay(model.components["temporal"].model, trace)
 
 
 if __name__ == "__main__":

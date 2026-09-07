@@ -68,6 +68,7 @@ class MoshiStreamingApp:
         mimi_frames = []
         audio_frames = []
         temporal_frames = []
+        temporal_inputs = []
         waves = []
         text_frames = []
         lm = self.generator.lm_model
@@ -75,6 +76,7 @@ class MoshiStreamingApp:
         forward_depformer = lm.forward_depformer
 
         def trace_text(*args, **kwargs):
+            temporal_inputs.append(args[0].detach().cpu().clone())
             hidden, logits = forward_text(*args, **kwargs)
             temporal_frames.append(hidden.detach().cpu().clone())
             return hidden, logits
@@ -86,6 +88,8 @@ class MoshiStreamingApp:
 
         with self.mimi.streaming(audio.shape[0]), self.generator.streaming(audio.shape[0]), patch.object(lm, "forward_depformer", trace_depformer):
             state = self.generator._streaming_state
+            if state.condition_sum is not None or state.condition_cross is not None:
+                raise ValueError("Temporal replay tracing requires an unconditioned checkpoint")
             state.graphed_main = trace_text
             state.graphed_depth = self.generator.depformer_step
             for frame in range(audio.shape[-1] // 1920):
@@ -107,6 +111,7 @@ class MoshiStreamingApp:
             return torch.cat(values, dim=-1) if values else torch.empty(0)
 
         trace = {
+            "temporal_sequence": cat_frames(temporal_inputs),
             "mimi_codes": cat_frames(mimi_frames),
             "audio_codes": cat_frames(audio_frames),
             "text_tokens": cat_frames(text_frames),
