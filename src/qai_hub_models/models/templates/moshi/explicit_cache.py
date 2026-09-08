@@ -30,6 +30,7 @@ class TemporalBlock(nn.Module):
     def forward(
         self, hidden: torch.Tensor, cache: torch.Tensor, position: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        position = position.to(torch.long)
         attention = self.layer.self_attn
         projected = attention.in_projs[0](self.layer.norm1(hidden))
         query_width = self.heads * self.head_dim

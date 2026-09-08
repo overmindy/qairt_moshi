@@ -59,7 +59,7 @@ def main() -> None:
         print("Explicit Temporal cache parity: PASS")
         embedded = temporal.embed(sequence[..., :1].to(args.device)).cpu().float()
         block = copy.deepcopy(temporal.blocks[0]).cpu().float().eval()
-        inputs = (embedded, block.empty_cache(), torch.zeros(1, dtype=torch.int64))
+        inputs = (embedded, block.empty_cache(), torch.zeros(1, dtype=torch.int32))
         args.output_dir.mkdir(parents=True, exist_ok=True)
         destination = args.output_dir / "temporal_block_0.onnx"
         torch.onnx.export(
