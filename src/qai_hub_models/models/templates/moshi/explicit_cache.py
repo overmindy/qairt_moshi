@@ -30,6 +30,13 @@ class TemporalBlock(nn.Module):
     def forward(
         self, hidden: torch.Tensor, cache: torch.Tensor, position: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        hidden, keys, values = self.forward_split(hidden, cache[0], cache[1], position)
+        return hidden, torch.stack((keys, values))
+
+    def forward_split(
+        self, hidden: torch.Tensor, key_cache: torch.Tensor,
+        value_cache: torch.Tensor, position: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         position = position.to(torch.long)
         attention = self.layer.self_attn
         projected = attention.in_projs[0](self.layer.norm1(hidden))
@@ -43,9 +50,9 @@ class TemporalBlock(nn.Module):
             query, key = attention.rope(query, key, position, time_before_heads=False)
         slots = torch.arange(self.capacity, device=position.device)
         write_mask = (slots == position % self.capacity).reshape(1, 1, self.capacity, 1)
-        keys = torch.where(write_mask, key, cache[0])
-        values = torch.where(write_mask, value, cache[1])
-        updated_cache = torch.stack((keys, values))
+        keys = torch.where(write_mask, key, key_cache)
+        values = torch.where(write_mask, value, value_cache)
+        updated_keys, updated_values = keys, values
         delta = slots - (position.reshape(1, 1) % self.capacity)
         key_positions = torch.where(delta <= 0, position + delta, position + delta - self.capacity)
         valid = (key_positions >= 0) & ((position - key_positions) < self.capacity)
@@ -62,7 +69,30 @@ class TemporalBlock(nn.Module):
             update = self.layer.linear2(self.layer.activation(self.layer.linear1(normalized)))
         else:
             update = self.layer.gating(normalized)
-        return hidden.to(update) + self.layer.layer_scale_2(update), updated_cache
+        return hidden.to(update) + self.layer.layer_scale_2(update), updated_keys, updated_values
+
+
+class TemporalShard(nn.Module):
+    """Consecutive real Temporal layers with separate per-layer K/V interfaces."""
+
+    def __init__(self, blocks: list[TemporalBlock]) -> None:
+        super().__init__()
+        if not blocks:
+            raise ValueError("A shard must contain at least one layer")
+        self.blocks = nn.ModuleList(blocks)
+
+    def forward(
+        self, hidden: torch.Tensor, position: torch.Tensor, *caches: torch.Tensor,
+    ) -> tuple[torch.Tensor, ...]:
+        if len(caches) != 2 * len(self.blocks):
+            raise ValueError("Expected one key and one value cache per layer")
+        updated = []
+        for index, block in enumerate(self.blocks):
+            hidden, keys, values = block.forward_split(
+                hidden, caches[2 * index], caches[2 * index + 1], position
+            )
+            updated.extend((keys, values))
+        return hidden, *updated
 
 
 class ExplicitTemporal(nn.Module):
