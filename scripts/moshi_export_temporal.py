@@ -68,9 +68,28 @@ def main() -> None:
             output_names=["output_hidden", "output_cache"],
         )
         import onnx
+        import onnxruntime as ort
 
         onnx.checker.check_model(str(destination))
-        torch.save({"inputs": inputs, "outputs": block(*inputs)}, args.output_dir / "block_0_reference.pt")
+        expected_outputs = block(*inputs)
+        session = ort.InferenceSession(str(destination), providers=["CPUExecutionProvider"])
+        actual_outputs = session.run(
+            ["output_hidden", "output_cache"],
+            {name: value.numpy() for name, value in zip(("hidden", "cache", "position"), inputs, strict=True)},
+        )
+        for name, actual, expected in zip(
+            ("output_hidden", "output_cache"), actual_outputs, expected_outputs, strict=True
+        ):
+            actual_tensor = torch.from_numpy(actual)
+            maximum = (actual_tensor - expected).abs().max().item()
+            print(f"ONNX CPU {name}: max_abs={maximum:.8g}")
+            torch.testing.assert_close(actual_tensor, expected, rtol=1e-4, atol=1e-5)
+        torch.testing.assert_close(
+            torch.from_numpy(actual_outputs[1])[:, :, :, 1:, :],
+            inputs[1][:, :, :, 1:, :], rtol=0, atol=0,
+        )
+        print("ONNX CPU first-step parity and untouched cache: PASS")
+        torch.save({"inputs": inputs, "outputs": expected_outputs}, args.output_dir / "block_0_reference.pt")
         print(f"ONNX checker: PASS; exported {destination}")
 
 
