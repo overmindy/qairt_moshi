@@ -6,6 +6,7 @@ import argparse
 import copy
 import hashlib
 import json
+import re
 from pathlib import Path
 
 import numpy as np
@@ -27,10 +28,16 @@ def prepare(args: argparse.Namespace) -> None:
                 if attribute.name == "value":
                     constants[node.output[0]] = numpy_helper.to_array(attribute.t)
     producers = {output: node for node in model.graph.node for output in node.output}
-    reductions = [node for node in model.graph.node if node.op_type == "ReduceMean"
-                  and ("/norm1/" in node.name or "/norm2/" in node.name)]
+    all_reductions = [node for node in model.graph.node if node.op_type == "ReduceMean"]
+    reductions = [node for node in all_reductions
+                  if any(re.fullmatch(r"norm[12](?:_\d+)?", part)
+                         for part in node.name.split("/"))]
     if len(reductions) != 4:
-        raise ValueError(f"Expected four RMSNorms, found {len(reductions)}")
+        raise ValueError(
+            f"Expected four RMSNorms, found {len(reductions)}; "
+            f"all ReduceMean nodes: {[node.name for node in all_reductions]}"
+        )
+    print("Matched RMSNorm reductions:", [node.name for node in reductions], flush=True)
     insertions = {}
     changes = []
     for index, reduction in enumerate(reductions):
