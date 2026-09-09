@@ -18,6 +18,7 @@ class TemporalBlock(nn.Module):
         if len(attention.in_projs) != 1 or len(attention.out_projs) != 1:
             raise ValueError("Per-step attention projections are unsupported")
         self.layer = layer
+        self.dynamic_rmsnorm = False
         self.capacity = attention.context
         self.heads = attention.num_heads
         self.kv_heads = attention.num_heads // attention.kv_repeat
@@ -39,7 +40,7 @@ class TemporalBlock(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         position = position.to(torch.long)
         attention = self.layer.self_attn
-        projected = attention.in_projs[0](self.layer.norm1(hidden))
+        projected = attention.in_projs[0](self.normalize(self.layer.norm1, hidden))
         query_width = self.heads * self.head_dim
         kv_width = self.kv_heads * self.head_dim
         query, key, value = projected.split((query_width, kv_width, kv_width), dim=-1)
@@ -64,12 +65,20 @@ class TemporalBlock(nn.Module):
         )
         update = attention.out_projs[0](update.transpose(1, 2).reshape(1, 1, query_width))
         hidden = hidden.to(update) + self.layer.layer_scale_1(update)
-        normalized = self.layer.norm2(hidden)
+        normalized = self.normalize(self.layer.norm2, hidden)
         if self.layer.gating is None:
             update = self.layer.linear2(self.layer.activation(self.layer.linear1(normalized)))
         else:
             update = self.layer.gating(normalized)
         return hidden.to(update) + self.layer.layer_scale_2(update), updated_keys, updated_values
+
+    def normalize(self, norm: nn.Module, hidden: torch.Tensor) -> torch.Tensor:
+        if not self.dynamic_rmsnorm:
+            return norm(hidden)
+        scale = hidden.abs().amax(dim=-1, keepdim=True).clamp_min(1.0)
+        scaled = hidden / scale
+        variance = (scaled * scaled).mean(dim=-1, keepdim=True) + norm.eps / scale / scale
+        return (scaled / variance.sqrt()) * norm.alpha
 
 
 class TemporalShard(nn.Module):

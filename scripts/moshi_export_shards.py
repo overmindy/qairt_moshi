@@ -23,9 +23,11 @@ from qai_hub_models.models.templates.moshi.external_repos.moshi.moshi.moshi.util
 @torch.no_grad()
 def export_shard(
     temporal: ExplicitTemporal, start: int, end: int,
-    frame_inputs: list[torch.Tensor], output_dir: Path,
+    frame_inputs: list[torch.Tensor], output_dir: Path, dynamic_rmsnorm: bool = False,
 ) -> dict:
     shard = copy.deepcopy(TemporalShard(list(temporal.blocks[start:end]))).cpu().float().eval()
+    for block in shard.blocks:
+        block.dynamic_rmsnorm = dynamic_rmsnorm
     names = [f"layer_{index}_{kind}" for index in range(start, end) for kind in ("key", "value")]
     input_names = ["hidden", "position", *names]
     output_names = ["output_hidden", *(f"output_{name}" for name in names)]
@@ -45,14 +47,18 @@ def export_shard(
         packed_hidden = hidden
         packed_outputs = []
         for index, block in enumerate(shard.blocks):
+            block.dynamic_rmsnorm = False
             packed_hidden, packed_cache = block(
                 packed_hidden, torch.stack(caches[2 * index:2 * index + 2]), position
             )
             packed_outputs.extend(packed_cache.unbind(0))
+            block.dynamic_rmsnorm = dynamic_rmsnorm
         inputs = (hidden, position, *caches)
         expected = shard(*inputs)
         for actual, reference in zip(expected, (packed_hidden, *packed_outputs), strict=True):
-            torch.testing.assert_close(actual, reference, rtol=0, atol=0)
+            torch.testing.assert_close(actual, reference,
+                                       rtol=1e-4 if dynamic_rmsnorm else 0,
+                                       atol=1e-5 if dynamic_rmsnorm else 0)
         ort_inputs = dict(zip(input_names, (hidden.numpy(), position.numpy(), *ort_caches), strict=True))
         actual_outputs = session.run(output_names, ort_inputs)
         for name, actual, reference in zip(output_names, actual_outputs, expected, strict=True):
@@ -90,6 +96,7 @@ def main() -> None:
     parser.add_argument("--start-layer", type=int, default=0)
     parser.add_argument("--end-layer", type=int, default=2, help="Exclusive layer bound")
     parser.add_argument("--all-layers", action="store_true")
+    parser.add_argument("--dynamic-rmsnorm", action="store_true")
     args = parser.parse_args()
     manifest_path = args.output_dir / "manifest.json"
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
@@ -122,8 +129,10 @@ def main() -> None:
                     "embedding_and_text_head": "PyTorch; not included in exported shards",
                     "boundary_inputs": "BF16 PyTorch Temporal replay; per-shard FP32 ONNX parity",
                     "cloud_validation": "pending", "shards": []}
+        manifest["rmsnorm"] = "dynamic_max" if args.dynamic_rmsnorm else "original"
         for start, stop in ranges:
-            entry = export_shard(temporal, start, stop, boundaries[start], args.output_dir)
+            entry = export_shard(temporal, start, stop, boundaries[start], args.output_dir,
+                                 args.dynamic_rmsnorm)
             manifest["shards"].append(entry)
             manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
             gc.collect()
