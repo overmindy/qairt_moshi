@@ -1,4 +1,4 @@
-"""Compare two-frame full Temporal ONNX and cloud chains with resumable jobs."""
+"""Compare multi-frame full Temporal ONNX and cloud chains with resumable jobs."""
 
 from __future__ import annotations
 
@@ -84,7 +84,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--export-dir", type=Path, required=True)
     parser.add_argument("--run-dir", type=Path, required=True)
+    parser.add_argument("--frames", type=int, default=2)
+    parser.add_argument("--input-hidden", type=Path, help="NPY array [frames, 1, 1, hidden_dim] of real replay embeddings")
     args = parser.parse_args()
+    if args.frames < 1:
+        parser.error("--frames must be positive")
     root = args.export_dir
     manifest = json.loads((root / "manifest.json").read_text())
     shards = sorted(manifest["shards"], key=lambda item: item["start_layer"])
@@ -100,7 +104,18 @@ def main() -> None:
         raise ValueError("Expected all 32 Temporal layers")
     args.run_dir.mkdir(parents=True, exist_ok=True)
     references = torch.load(root / shards[0]["reference"], map_location="cpu", weights_only=True)
-    cpu_hidden = [references[frame]["inputs"]["hidden"].numpy().copy() for frame in range(2)]
+    if args.input_hidden is None:
+        if len(references) < args.frames:
+            raise ValueError("Not enough saved frames; provide --input-hidden from moshi_prepare_chain_inputs.py")
+        cpu_hidden = [references[frame]["inputs"]["hidden"].numpy().copy() for frame in range(args.frames)]
+    else:
+        inputs = np.load(args.input_hidden, allow_pickle=False)
+        expected_shape = tuple(references[0]["inputs"]["hidden"].shape)
+        if inputs.ndim != 4 or inputs.shape[0] < args.frames or inputs.shape[1:] != expected_shape:
+            raise ValueError(f"Expected at least {args.frames} embeddings with shape {expected_shape}")
+        if inputs.dtype != np.float32 or not np.isfinite(inputs[:args.frames]).all():
+            raise ValueError("Embeddings must be finite FP32")
+        cpu_hidden = [value.copy() for value in inputs[:args.frames]]
     cloud_hidden = [hidden.copy() for hidden in cpu_hidden]
     del references
     reports = []
@@ -116,7 +131,7 @@ def main() -> None:
         cloud_cache = [value.copy() for value in cpu_cache]
         del references
         session = ort.InferenceSession(str(root / shard["onnx"]), providers=["CPUExecutionProvider"])
-        for frame in range(2):
+        for frame in range(args.frames):
             position = np.array([frame], dtype=np.int32)
             cpu_inputs = dict(zip(shard["input_names"],
                                   [cpu_hidden[frame], position, *cpu_cache], strict=True))
@@ -146,7 +161,7 @@ def main() -> None:
         gc.collect()
     np.savez(args.run_dir / "final_hidden.npz",
              cpu=np.stack(cpu_hidden), cloud=np.stack(cloud_hidden))
-    print("Completed 32-layer, two-frame chains; untouched cloud caches: PASS.")
+    print(f"Completed 32-layer, {args.frames}-frame chains; untouched cloud caches: PASS.")
     print("Numerical errors are in metrics.json; no automatic accuracy acceptance threshold applied.")
     print("Embedding inputs are saved replay inputs; final norm/text head, DepFormer and Mimi are not included.")
 
