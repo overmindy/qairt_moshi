@@ -152,6 +152,8 @@ def main() -> None:
                     raise ValueError(f"Invalid cache: {name}")
                 slot = frame % received.shape[2]
                 for lower, upper in ((0, slot), (slot + 1, received.shape[2])):
+                    if lower >= upper:
+                        continue
                     untouched_actual = received[:, :, lower:upper]
                     untouched_previous = previous[:, :, lower:upper]
                     if args.quantized:
