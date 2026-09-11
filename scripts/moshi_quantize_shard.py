@@ -15,6 +15,7 @@ def main() -> None:
     parser.add_argument("--shard", default="temporal_layers_0_1.onnx")
     parser.add_argument("--samples", type=int, default=2)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--source-model-id", help="Existing uploaded Hub model ID; skips ONNX upload")
     args = parser.parse_args()
     manifest = json.loads((args.export_dir / "manifest.json").read_text())
     shard = next(item for item in manifest["shards"] if item["onnx"] == args.shard)
@@ -29,7 +30,7 @@ def main() -> None:
     from qai_hub_models import Precision
     from qai_hub_models.utils.qai_hub_helpers import make_hub_dataset_entries
 
-    model = hub.upload_model(str(args.export_dir / args.shard))
+    model = hub.get_model(args.source_model_id) if args.source_model_id else hub.upload_model(str(args.export_dir / args.shard))
     entries = make_hub_dataset_entries(calibration, input_names)
     quantize = hub.submit_quantize_job(
         model=model, calibration_data=entries,

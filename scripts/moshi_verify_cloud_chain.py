@@ -86,6 +86,7 @@ def main() -> None:
     parser.add_argument("--run-dir", type=Path, required=True)
     parser.add_argument("--frames", type=int, default=2)
     parser.add_argument("--input-hidden", type=Path, help="NPY array [frames, 1, 1, hidden_dim] of real replay embeddings")
+    parser.add_argument("--target-override", help="Target model ID for the first 0:2 shard")
     args = parser.parse_args()
     if args.frames < 1:
         parser.error("--frames must be positive")
@@ -139,7 +140,8 @@ def main() -> None:
             cloud_inputs = dict(zip(shard["input_names"],
                                     [cloud_hidden[frame], position, *cloud_cache], strict=True))
             stem = args.run_dir / f"layers_{start}_{end}_frame_{frame}"
-            actual = cloud_step(targets[(start, end)], cloud_inputs, shard["output_names"], stem)
+            target_id = args.target_override if args.target_override and (start, end) == (0, 2) else targets[(start, end)]
+            actual = cloud_step(target_id, cloud_inputs, shard["output_names"], stem)
             result = {"start": start, "end": end, "frame": frame,
                       "hidden": metrics(actual[0], expected[0]), "cache": {}}
             for name, received, reference, previous in zip(
