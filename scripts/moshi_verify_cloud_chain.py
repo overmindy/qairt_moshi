@@ -87,6 +87,7 @@ def main() -> None:
     parser.add_argument("--frames", type=int, default=2)
     parser.add_argument("--input-hidden", type=Path, help="NPY array [frames, 1, 1, hidden_dim] of real replay embeddings")
     parser.add_argument("--target-override", help="Target model ID for the first 0:2 shard")
+    parser.add_argument("--quantized", action="store_true", help="Allow bounded numerical changes in untouched cache regions")
     args = parser.parse_args()
     if args.frames < 1:
         parser.error("--frames must be positive")
@@ -151,7 +152,13 @@ def main() -> None:
                     raise ValueError(f"Invalid cache: {name}")
                 slot = frame % received.shape[2]
                 for lower, upper in ((0, slot), (slot + 1, received.shape[2])):
-                    if not np.array_equal(received[:, :, lower:upper], previous[:, :, lower:upper]):
+                    untouched_actual = received[:, :, lower:upper]
+                    untouched_previous = previous[:, :, lower:upper]
+                    if args.quantized:
+                        untouched_error = metrics(untouched_actual, untouched_previous)
+                        if untouched_error["max_abs"] > 0.25:
+                            raise ValueError(f"Untouched quantized cache changed too much: {stem.name} {name}: {untouched_error}")
+                    elif not np.array_equal(untouched_actual, untouched_previous):
                         raise ValueError(f"Untouched cache changed: {stem.name} {name}")
                 result["cache"][name] = metrics(received[:, :, slot], reference[:, :, slot])
             print(json.dumps(result), flush=True)
