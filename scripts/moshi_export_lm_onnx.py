@@ -67,16 +67,21 @@ def _export(
     input_names: list[str],
     output_names: list[str],
 ) -> None:
-    torch.onnx.export(
-        module,
-        inputs,
-        str(path),
-        opset_version=17,
-        dynamo=False,
-        do_constant_folding=True,
-        input_names=input_names,
-        output_names=output_names,
-    )
+    # Kyutai wraps RMSNorm and a few other eager functions with torch.compile.
+    # PyTorch's legacy ONNX exporter traces with TorchScript and cannot enter a
+    # Dynamo-optimized callable while tracing, so force the pinned upstream
+    # implementation back to its original eager functions for every graph.
+    with no_compile():
+        torch.onnx.export(
+            module,
+            inputs,
+            str(path),
+            opset_version=17,
+            dynamo=False,
+            do_constant_folding=True,
+            input_names=input_names,
+            output_names=output_names,
+        )
     onnx.checker.check_model(str(path))
     print(f"ONNX checker PASS: {path}", flush=True)
 
