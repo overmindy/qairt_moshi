@@ -19,6 +19,15 @@ def _weight_index(module: nn.Module, step: int) -> int:
     return schedule[step] if schedule is not None else step
 
 
+def _cache_capacity(attention: nn.Module) -> int:
+    """Match upstream StreamingMultiheadAttention cache allocation."""
+    if attention.context is not None:
+        return attention.context
+    if attention.weights_per_step:
+        return attention.weights_per_step
+    raise ValueError("Attention has neither a context nor weights-per-step capacity")
+
+
 class TemporalBlock(nn.Module):
     def __init__(self, layer: nn.Module) -> None:
         super().__init__()
@@ -196,13 +205,13 @@ class ExplicitDepFormer(nn.Module):
             attention = layer.self_attn
             if layer.skip_self_attn or layer.cross_attention is not None:
                 raise ValueError("Only causal DepFormer self-attention is supported")
-            if not attention.causal or attention.context is None:
-                raise ValueError("DepFormer requires a finite causal context")
+            if not attention.causal:
+                raise ValueError("DepFormer attention must be causal")
             if attention.rope is not None:
                 raise ValueError(
                     "This export expects the checkpoint's position-free DepFormer"
                 )
-            if attention.context < lm.dep_q:
+            if _cache_capacity(attention) < lm.dep_q:
                 raise ValueError("DepFormer context is shorter than dep_q")
             if attention.weights_per_step != lm.dep_q:
                 raise ValueError("Expected one DepFormer attention weight set per codebook")
@@ -227,7 +236,7 @@ class ExplicitDepFormer(nn.Module):
         attention = layer.self_attn
         heads = attention.num_heads // attention.kv_repeat
         head_dim = attention.embed_dim // attention.num_heads
-        shape = (hidden.shape[0], heads, attention.context, head_dim)
+        shape = (hidden.shape[0], heads, _cache_capacity(attention), head_dim)
         return hidden.new_zeros(shape), hidden.new_zeros(shape)
 
     @staticmethod
@@ -239,6 +248,7 @@ class ExplicitDepFormer(nn.Module):
         step: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         attention = layer.self_attn
+        capacity = _cache_capacity(attention)
         projection_index = _weight_index(attention, step)
         projected = attention.in_projs[projection_index](layer.norm1(hidden))
         heads = attention.num_heads
@@ -251,8 +261,8 @@ class ExplicitDepFormer(nn.Module):
         key = key.reshape(hidden.shape[0], 1, kv_heads, head_dim).transpose(1, 2)
         value = value.reshape(hidden.shape[0], 1, kv_heads, head_dim).transpose(1, 2)
 
-        slots = torch.arange(attention.context, device=hidden.device)
-        write_mask = (slots == step).reshape(1, 1, attention.context, 1)
+        slots = torch.arange(capacity, device=hidden.device)
+        write_mask = (slots == step).reshape(1, 1, capacity, 1)
         keys = torch.where(write_mask, key, key_cache)
         values = torch.where(write_mask, value, value_cache)
         attention_keys = keys
@@ -260,7 +270,7 @@ class ExplicitDepFormer(nn.Module):
         if attention.kv_repeat > 1:
             attention_keys = attention_keys.repeat_interleave(attention.kv_repeat, dim=1)
             attention_values = attention_values.repeat_interleave(attention.kv_repeat, dim=1)
-        valid = (slots <= step).reshape(1, 1, 1, attention.context)
+        valid = (slots <= step).reshape(1, 1, 1, capacity)
         update = functional.scaled_dot_product_attention(
             query,
             attention_keys,
@@ -341,7 +351,7 @@ class DepFormerStepBlock(nn.Module):
             None if layer.gating is None else layer.gating[_weight_index(layer, step)]
         )
         self.step = step
-        self.context = attention.context
+        self.context = _cache_capacity(attention)
         self.heads = attention.num_heads
         self.kv_heads = attention.num_heads // attention.kv_repeat
         self.kv_repeat = attention.kv_repeat
