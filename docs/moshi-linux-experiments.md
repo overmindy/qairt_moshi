@@ -1,5 +1,65 @@
 # Moshi Linux Migration and Experiments
 
+## Clean ONNX baseline: complete language-model inference
+
+Start from these three source locations:
+
+- Kyutai's pinned `models/lm.py`: `LMModel.forward()` and
+  `forward_depformer_training()` are training paths; `LMGen._step()` is the
+  inference call chain that must be preserved.
+- `templates/moshi/explicit_cache.py`: converts hidden Python streaming state
+  into tensor state. Temporal KV survives between 80 ms frames, while
+  DepFormer KV lives for only the eight codebook steps inside one frame.
+- `scripts/moshi_export_lm_onnx.py`: validates that rewrite against the pinned
+  upstream code before writing any ONNX, exports every LM weight, then executes
+  the resulting graphs with ONNX Runtime.
+
+The complete LM is a graph set rather than one `.onnx` file. The 7B FP32 model
+exceeds ONNX's single-protobuf size limit, and Qualcomm compilation also needs
+smaller partitions. The graph set contains the embedding frontend, all 32
+Temporal layers in consecutive shards, the text head, and one statically
+specialized graph for each of the eight greedy DepFormer codebook steps.
+`manifest.json` records their order, names, cache shapes, and host-owned state.
+This is still one complete LM inference step: splitting storage does not omit
+weights or change the math. It also keeps each FP32 file below ONNX's 2 GB
+protobuf limit; the full DepFormer would exceed that limit because its eight
+steps use different attention and feed-forward weights.
+
+Do the cheap, decisive comparison first. It loads the real BF16 checkpoint but
+does not spend time writing roughly tens of gigabytes of FP32 ONNX files:
+
+```bash
+CUDA_VISIBLE_DEVICES=7 python scripts/moshi_streaming_trace.py \
+  --model-dir /data2/liuguohong/moshiko-pytorch-bf16 \
+  --device cuda:0 --frames 4 --verify-temporal-replay \
+  --output-dir /data2/user/moshi-work/moshi-trace-v1
+
+CUDA_VISIBLE_DEVICES=7 python scripts/moshi_export_lm_onnx.py \
+  --model-dir /data2/liuguohong/moshiko-pytorch-bf16 \
+  --trace-dir /data2/user/moshi-work/moshi-trace-v1 \
+  --device cuda:0 --frames 2 --validate-only
+```
+
+The required result is `Pinned-upstream inference rewrite parity: PASS`, with
+zero error for Temporal hidden/text logits and for DepFormer tokens/logits on
+both frames. Only after that passes, export all 32 layers and run ONNX Runtime:
+
+```bash
+CUDA_VISIBLE_DEVICES=7 python scripts/moshi_export_lm_onnx.py \
+  --model-dir /data2/liuguohong/moshiko-pytorch-bf16 \
+  --trace-dir /data2/user/moshi-work/moshi-trace-v1 \
+  --device cuda:0 --frames 2 --layers-per-shard 2 \
+  --output-dir /data2/user/moshi-work/moshi-lm-onnx-v1
+```
+
+Use a new empty output directory for every attempt. A successful run requires
+all of the following, not merely that files exist: pinned-upstream rewrite
+parity, ONNX checker success for every graph, finite ONNX Runtime outputs,
+two-frame cache reuse, and per-graph PyTorch/ONNX parity. The Mimi streaming
+encoder/decoder are intentionally not included in this LM checkpoint: their
+convolution and Transformer streaming states require a separate explicit-state
+rewrite before they can be called a correct end-to-end Moshi export.
+
 ## Explicit Temporal cache and first compiler artifact
 
 After collecting `temporal_sequence.pt`, run:
