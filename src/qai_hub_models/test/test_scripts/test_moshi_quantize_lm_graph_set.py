@@ -13,9 +13,7 @@ def _load_script() -> ModuleType:
         / "scripts"
         / "moshi_quantize_lm_graph_set.py"
     )
-    spec = importlib.util.spec_from_file_location(
-        "moshi_quantize_lm_graph_set", path
-    )
+    spec = importlib.util.spec_from_file_location("moshi_quantize_lm_graph_set", path)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -43,6 +41,14 @@ def test_calibration_entries_preserve_onnx_integer_dtypes(tmp_path: Path) -> Non
     assert entries["position"][0].dtype == np.int64
     assert entries["previous_token"][0].dtype == np.int64
     assert entries["hidden"][0].dtype == np.float32
+
+
+def test_qnn_context_workflow_compiles_to_dlc_before_linking() -> None:
+    module = _load_script()
+
+    assert module.COMPILE_RUNTIME.value == "qnn_dlc"
+    assert module._compile_options() == "--target_runtime qnn_dlc"
+    assert "qnn_context_binary" not in module._compile_options()
 
 
 class _FakeJob:

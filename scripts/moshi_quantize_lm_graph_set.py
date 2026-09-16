@@ -21,12 +21,26 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from qai_hub_models import Precision
+from qai_hub_models import Precision, TargetRuntime
 
 GRAPH_SET_FORMAT = "moshi-lm-onnx-graph-set-v1"
 CALIBRATION_FORMAT = "moshi-lm-graph-calibration-v1"
 RESULT_FORMAT = "moshi-lm-ai-hub-quantization-v1"
 PREFLIGHT_RECEIPT_VERSION = 1
+COMPILE_RUNTIME = TargetRuntime.QNN_DLC
+
+
+def _compile_options() -> str:
+    """Return the AI Hub compile flag for the Moshi QNN DLC stage.
+
+    A QNN context binary is not a compile target in current AI Hub clients.
+    The supported flow is compile(qnn_dlc), followed by a separate link job
+    when a context binary is needed.
+    """
+    options = COMPILE_RUNTIME.aihub_target_runtime_flag
+    if options is None:
+        raise RuntimeError(f"AI Hub cannot compile {COMPILE_RUNTIME.value}")
+    return options
 
 
 def _sha256(path: Path) -> str:
@@ -55,8 +69,7 @@ def _preflight_file_stamps(
     calibration: dict[str, Any],
 ) -> dict[str, dict[str, dict[str, int]]]:
     onnx_files = {
-        spec["onnx"]: _file_stamp(onnx_dir / spec["onnx"])
-        for _, _, spec in graph_specs
+        spec["onnx"]: _file_stamp(onnx_dir / spec["onnx"]) for _, _, spec in graph_specs
     }
     calibration_files = {
         sample["file"]: _file_stamp(calibration_dir / sample["file"])
@@ -338,9 +351,7 @@ def _recheck_recorded_target(
         record.pop(model_id_key, None)
         record.pop(job_id_key, None)
         record["status"] = f"{stage}_failed"
-        record["error"] = (
-            f"Recorded {stage} job failed: {_status_summary(status)}"
-        )
+        record["error"] = f"Recorded {stage} job failed: {_status_summary(status)}"
         return "retry", None
 
     record.pop(model_id_key, None)
@@ -578,7 +589,14 @@ def main() -> None:
                 f"Cannot resume with a different target device: "
                 f"{existing_target} != {requested_target}"
             )
+        existing_runtime = result.get("compile_runtime")
+        if existing_runtime is not None and existing_runtime != COMPILE_RUNTIME.value:
+            raise SystemExit(
+                "Cannot resume with a different compile runtime: "
+                f"{existing_runtime} != {COMPILE_RUNTIME.value}"
+            )
         result["target_device"] = requested_target
+        result["compile_runtime"] = COMPILE_RUNTIME.value
         _write_json(result_path, result)
 
     if args.dry_run:
@@ -681,9 +699,7 @@ def main() -> None:
             record["quantized_model_id"] = target.model_id
             record["status"] = "quantize_succeeded"
             record.pop("error", None)
-            print(
-                f"quantize succeeded: {name} model={target.model_id}", flush=True
-            )
+            print(f"quantize succeeded: {name} model={target.model_id}", flush=True)
         except Exception as error:
             record["status"] = "quantize_failed"
             record["error"] = f"{type(error).__name__}: {error}"
@@ -738,9 +754,13 @@ def main() -> None:
                             args.calibration_dir, calibration["graphs"][name]
                         ),
                         device=device,
-                        name=f"moshi-{name}-{record['precision']}-qnn",
-                        options="--target_runtime qnn_context_binary",
+                        name=(
+                            f"moshi-{name}-{record['precision']}-"
+                            f"{COMPILE_RUNTIME.value.replace('_', '-')}"
+                        ),
+                        options=_compile_options(),
                     )
+                    record["compile_runtime"] = COMPILE_RUNTIME.value
                     record["compile_job_id"] = job.job_id
                     record["status"] = "compile_submitted"
                     _write_json(result_path, result)
