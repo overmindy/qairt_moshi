@@ -21,7 +21,6 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from qai_hub_models import Precision
-from qai_hub_models.utils.qai_hub_helpers import make_hub_dataset_entries
 
 GRAPH_SET_FORMAT = "moshi-lm-onnx-graph-set-v1"
 CALIBRATION_FORMAT = "moshi-lm-graph-calibration-v1"
@@ -179,12 +178,19 @@ def _validate_calibration(
 def _load_calibration_entries(
     calibration_dir: Path, graph: dict[str, Any]
 ) -> dict[str, list[np.ndarray]]:
+    """Load captured feeds without changing the ONNX input dtypes.
+
+    The generic ``make_hub_dataset_entries`` helper converts int64 arrays to
+    int32 for common device inputs. Moshi's exported ONNX graphs declare
+    sequence, position, and previous_token as int64, so that conversion makes
+    AI Hub reject the calibration dataset before quantization starts.
+    """
     values: list[list[np.ndarray]] = [[] for _ in graph["input_names"]]
     for sample in graph["samples"]:
         with np.load(calibration_dir / sample["file"]) as arrays:
             for index, name in enumerate(graph["input_names"]):
                 values[index].append(np.array(arrays[name], copy=True))
-    return make_hub_dataset_entries(tuple(values), graph["input_names"])
+    return dict(zip(graph["input_names"], values, strict=True))
 
 
 def _input_specs(calibration_dir: Path, graph: dict[str, Any]) -> dict[str, Any]:
