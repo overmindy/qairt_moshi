@@ -150,12 +150,14 @@ def _graph_specs(manifest: dict[str, Any]) -> list[tuple[str, str, dict[str, Any
 
 
 def _precision_for_graph(requested: str, kind: str) -> Precision:
-    if requested == "auto":
-        return (
-            Precision.w8a16_mixed_fp16
-            if kind in {"temporal", "depformer"}
-            else Precision.w8a16
-        )
+    if requested in {"auto", "auto_int16"}:
+        if kind in {"temporal", "depformer"}:
+            return (
+                Precision.w8a16_mixed_fp16
+                if requested == "auto"
+                else Precision.w8a16_mixed_int16
+            )
+        return Precision.w8a16
     precision = Precision.parse(requested)
     if not precision.activations_type or not precision.weights_type:
         raise ValueError(f"{requested!r} is not a quantized W/A precision")
@@ -166,6 +168,62 @@ def _quantize_options(precision: Precision, litemp_percentage: float) -> str:
     return precision.get_hub_quantize_options(
         litemp_percentage if precision.override_type is not None else None
     )
+
+
+def _parse_graph_litemp_percentages(
+    values: list[str], graph_names: set[str]
+) -> dict[str, float]:
+    overrides: dict[str, float] = {}
+    for value in values:
+        name, separator, percentage_text = value.partition("=")
+        if not separator or not name or not percentage_text:
+            raise ValueError(
+                f"Invalid graph Lite-MP override {value!r}; expected GRAPH=PERCENTAGE"
+            )
+        if name not in graph_names:
+            raise ValueError(f"Unknown graph in Lite-MP override: {name}")
+        if name in overrides:
+            raise ValueError(f"Duplicate graph Lite-MP override: {name}")
+        try:
+            percentage = float(percentage_text)
+        except ValueError as error:
+            raise ValueError(
+                f"Invalid Lite-MP percentage for {name}: {percentage_text!r}"
+            ) from error
+        if not 0 < percentage <= 100:
+            raise ValueError(
+                f"Lite-MP percentage for {name} must be within (0, 100]"
+            )
+        overrides[name] = percentage
+    return overrides
+
+
+def _parse_graph_precisions(
+    values: list[str], graph_names: set[str]
+) -> dict[str, str]:
+    overrides: dict[str, str] = {}
+    allowed = {
+        "w8a16",
+        "w8a16_mixed_fp16",
+        "w8a16_mixed_int16",
+    }
+    for value in values:
+        name, separator, precision = value.partition("=")
+        if not separator or not name or not precision:
+            raise ValueError(
+                f"Invalid graph precision override {value!r}; expected GRAPH=PRECISION"
+            )
+        if name not in graph_names:
+            raise ValueError(f"Unknown graph in precision override: {name}")
+        if name in overrides:
+            raise ValueError(f"Duplicate graph precision override: {name}")
+        if precision not in allowed:
+            raise ValueError(
+                f"Unsupported graph precision {precision!r}; "
+                f"choose one of {sorted(allowed)}"
+            )
+        overrides[name] = precision
+    return overrides
 
 
 def _walk_dicts(value: Any) -> Iterator[dict[str, Any]]:
@@ -199,6 +257,89 @@ def _reusable_source_models(path: Path | None) -> dict[str, str]:
                 )
             reusable[checksum] = model_id
     return reusable
+
+
+def _result_seed(path: Path | None) -> dict[str, Any] | None:
+    """Load a compatible prior result for cross-output job reuse."""
+    if path is None:
+        return None
+    value = json.loads(path.read_text())
+    if value.get("format") != RESULT_FORMAT or not isinstance(
+        value.get("graphs"), dict
+    ):
+        return None
+    return value
+
+
+def _seed_compatible_results(
+    result: dict[str, Any],
+    source: dict[str, Any],
+) -> tuple[int, int]:
+    """Reuse only artifacts whose inputs, precision, and target still match.
+
+    Source ONNX uploads depend only on the file SHA256, so they remain reusable
+    when the precision changes. Quantized models additionally require the same
+    calibration manifest and quantization plan. Compiled models also require
+    the same target, runtime, and compile options. Live AI Hub status is checked
+    later before any seeded job is actually skipped.
+    """
+    quantize_count = 0
+    compile_count = 0
+    same_calibration = (
+        source.get("calibration_manifest_sha256")
+        == result.get("calibration_manifest_sha256")
+    )
+    same_compile_plan = all(
+        source.get(key) == result.get(key)
+        for key in ("target_device", "compile_runtime", "compile_options")
+    )
+
+    source_graphs = source.get("graphs", {})
+    for name, record in result["graphs"].items():
+        old = source_graphs.get(name)
+        if not isinstance(old, dict):
+            continue
+        if old.get("onnx_sha256") != record["onnx_sha256"]:
+            continue
+
+        source_model_id = old.get("source_model_id")
+        if isinstance(source_model_id, str):
+            record["source_model_id"] = source_model_id
+            record["source_reused_by_sha256"] = True
+
+        same_quantize_plan = same_calibration and all(
+            old.get(key) == record.get(key)
+            for key in ("precision", "quantize_options")
+        )
+        quantize_job_id = old.get("quantize_job_id")
+        quantized_model_id = old.get("quantized_model_id")
+        if not (
+            same_quantize_plan
+            and isinstance(quantize_job_id, str)
+            and isinstance(quantized_model_id, str)
+        ):
+            continue
+        record["quantize_job_id"] = quantize_job_id
+        record["quantized_model_id"] = quantized_model_id
+        record["status"] = "quantize_succeeded"
+        quantize_count += 1
+
+        compile_job_id = old.get("compile_job_id")
+        compiled_model_id = old.get("compiled_model_id")
+        if not (
+            same_compile_plan
+            and isinstance(compile_job_id, str)
+            and isinstance(compiled_model_id, str)
+        ):
+            continue
+        record["compile_job_id"] = compile_job_id
+        record["compiled_model_id"] = compiled_model_id
+        record["compile_runtime"] = result["compile_runtime"]
+        record["compile_options"] = result["compile_options"]
+        record["status"] = "compile_succeeded"
+        compile_count += 1
+
+    return quantize_count, compile_count
 
 
 def _validate_calibration(
@@ -367,10 +508,19 @@ def _build_result(
     litemp_percentage: float,
     graph_specs: list[tuple[str, str, dict[str, Any]]],
     calibration: dict[str, Any],
+    graph_litemp_percentages: dict[str, float] | None = None,
+    graph_precisions: dict[str, str] | None = None,
 ) -> dict[str, Any]:
+    graph_litemp_percentages = graph_litemp_percentages or {}
+    graph_precisions = graph_precisions or {}
     graphs = {}
     for name, kind, spec in graph_specs:
-        precision = _precision_for_graph(requested_precision, kind)
+        precision = _precision_for_graph(
+            graph_precisions.get(name, requested_precision), kind
+        )
+        graph_litemp_percentage = graph_litemp_percentages.get(
+            name, litemp_percentage
+        )
         calibration_graph = calibration["graphs"][name]
         graphs[name] = {
             "kind": kind,
@@ -378,7 +528,10 @@ def _build_result(
             "onnx_sha256": calibration_graph["onnx_sha256"],
             "input_names": spec["input_names"],
             "precision": str(precision),
-            "quantize_options": _quantize_options(precision, litemp_percentage),
+            "litemp_percentage": graph_litemp_percentage,
+            "quantize_options": _quantize_options(
+                precision, graph_litemp_percentage
+            ),
             "calibration_samples": [
                 {
                     "source_id": sample["source_id"],
@@ -394,6 +547,8 @@ def _build_result(
         "calibration_manifest_sha256": _sha256(calibration_manifest_path),
         "requested_precision": requested_precision,
         "litemp_percentage": litemp_percentage,
+        "graph_litemp_percentages": graph_litemp_percentages,
+        "graph_precisions": graph_precisions,
         "graphs": graphs,
     }
 
@@ -410,6 +565,12 @@ def _check_resume(existing: dict[str, Any], planned: dict[str, Any]) -> None:
             raise ValueError(
                 f"Cannot resume: {key} changed ({existing.get(key)!r} != {planned.get(key)!r})"
             )
+    if existing.get("graph_litemp_percentages", {}) != planned.get(
+        "graph_litemp_percentages", {}
+    ):
+        raise ValueError("Cannot resume: graph Lite-MP percentage overrides changed")
+    if existing.get("graph_precisions", {}) != planned.get("graph_precisions", {}):
+        raise ValueError("Cannot resume: graph precision overrides changed")
     if set(existing["graphs"]) != set(planned["graphs"]):
         raise ValueError("Cannot resume: graph set changed")
     for name, graph in planned["graphs"].items():
@@ -428,16 +589,38 @@ def main() -> None:
         default="auto",
         choices=(
             "auto",
+            "auto_int16",
             "w8a16",
             "w8a16_mixed_fp16",
             "w8a16_mixed_int16",
         ),
         help=(
             "auto uses W8A16 for frontend/head and W8A16 mixed FP16 for "
-            "Temporal/DepFormer (default: auto)"
+            "Temporal/DepFormer; auto_int16 changes those sensitive graphs to "
+            "W8A16 mixed INT16 (default: auto)"
         ),
     )
     parser.add_argument("--litemp-percentage", type=float, default=20.0)
+    parser.add_argument(
+        "--graph-litemp-percentage",
+        action="append",
+        default=[],
+        metavar="GRAPH=PERCENTAGE",
+        help=(
+            "Override Lite-MP percentage for one graph. Repeat for multiple "
+            "graphs; useful for retrying only HTP-incompatible shards."
+        ),
+    )
+    parser.add_argument(
+        "--graph-precision",
+        action="append",
+        default=[],
+        metavar="GRAPH=PRECISION",
+        help=(
+            "Override precision for one graph. Repeat for multiple graphs; "
+            "use GRAPH=w8a16 to disable Lite-MP only for a control shard."
+        ),
+    )
     parser.add_argument(
         "--target-device",
         help="Exact AI Hub device name. If omitted, stop after quantization.",
@@ -476,6 +659,17 @@ def main() -> None:
         raise SystemExit("Calibration does not match the ONNX graph manifest")
 
     graph_specs = _graph_specs(graph_manifest)
+    try:
+        graph_litemp_percentages = _parse_graph_litemp_percentages(
+            args.graph_litemp_percentage,
+            {name for name, _, _ in graph_specs},
+        )
+        graph_precisions = _parse_graph_precisions(
+            args.graph_precision,
+            {name for name, _, _ in graph_specs},
+        )
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
     planned = _build_result(
         graph_manifest_path,
         calibration_manifest_path,
@@ -483,7 +677,10 @@ def main() -> None:
         args.litemp_percentage,
         graph_specs,
         calibration,
+        graph_litemp_percentages,
+        graph_precisions,
     )
+    source_result = _result_seed(args.source_model_manifest)
     result_path = args.output_dir / "quantization_manifest.json"
     result_exists = result_path.exists()
     if result_exists:
@@ -496,10 +693,21 @@ def main() -> None:
             raise SystemExit("Use an empty --output-dir or pass --resume")
         args.output_dir.mkdir(parents=True, exist_ok=True)
         result = planned
+        if (
+            source_result is not None
+            and source_result.get("graph_manifest_sha256")
+            == planned["graph_manifest_sha256"]
+            and source_result.get("calibration_manifest_sha256")
+            == planned["calibration_manifest_sha256"]
+            and isinstance(source_result.get("preflight_receipt"), dict)
+        ):
+            result["preflight_receipt"] = source_result["preflight_receipt"]
 
     preflight_start = time.monotonic()
     preflight_cached = False
-    if args.resume and not args.refresh_preflight:
+    if not args.refresh_preflight and (
+        args.resume or result.get("preflight_receipt") is not None
+    ):
         receipt = result.get("preflight_receipt")
         receipt_matches, receipt_reason = _preflight_receipt_matches(
             receipt,
@@ -611,6 +819,19 @@ def main() -> None:
         result["compile_options"] = compile_options
         _write_json(result_path, result)
 
+    if not result_exists and source_result is not None:
+        reused_quantize, reused_compile = _seed_compatible_results(
+            result,
+            source_result,
+        )
+        _write_json(result_path, result)
+        print(
+            "[reuse] seeded prior successful jobs: "
+            f"quantize={reused_quantize}, compile={reused_compile}; "
+            "each job will be live-verified before skipping",
+            flush=True,
+        )
+
     if args.dry_run:
         print(
             f"Dry-run PASS: {len(graph_specs)} graphs, "
@@ -680,7 +901,7 @@ def main() -> None:
                 entries = _load_calibration_entries(
                     args.calibration_dir, calibration["graphs"][name]
                 )
-                precision = _precision_for_graph(args.precision, record["kind"])
+                precision = Precision.parse(record["precision"])
                 job = hub.submit_quantize_job(
                     model=model,
                     calibration_data=entries,

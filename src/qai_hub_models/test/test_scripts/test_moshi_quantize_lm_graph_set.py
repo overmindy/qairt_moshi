@@ -51,6 +51,143 @@ def test_qnn_context_workflow_compiles_to_dlc_before_linking() -> None:
     assert "qnn_context_binary" not in module._compile_options()
 
 
+def test_auto_int16_changes_only_stateful_graphs() -> None:
+    module = _load_script()
+
+    assert module._precision_for_graph("auto_int16", "frontend") == module.Precision.w8a16
+    assert module._precision_for_graph("auto_int16", "head") == module.Precision.w8a16
+    assert (
+        module._precision_for_graph("auto_int16", "temporal")
+        == module.Precision.w8a16_mixed_int16
+    )
+    assert (
+        module._precision_for_graph("auto_int16", "depformer")
+        == module.Precision.w8a16_mixed_int16
+    )
+
+
+def test_graph_litemp_percentage_override_is_targeted() -> None:
+    module = _load_script()
+
+    overrides = module._parse_graph_litemp_percentages(
+        ["temporal_layers_2_3=100"],
+        {"frontend", "temporal_layers_2_3"},
+    )
+
+    assert overrides == {"temporal_layers_2_3": 100.0}
+
+
+def test_graph_precision_can_disable_litemp_for_one_control_shard() -> None:
+    module = _load_script()
+
+    overrides = module._parse_graph_precisions(
+        ["temporal_layers_2_3=w8a16"],
+        {"frontend", "temporal_layers_2_3"},
+    )
+
+    assert overrides == {"temporal_layers_2_3": "w8a16"}
+
+
+def test_graph_precision_override_changes_concrete_quantization_plan(
+    tmp_path: Path,
+) -> None:
+    module = _load_script()
+    graph_manifest_path = tmp_path / "graph.json"
+    calibration_manifest_path = tmp_path / "calibration.json"
+    graph_manifest_path.write_text("{}")
+    calibration_manifest_path.write_text("{}")
+    graph_specs = [
+        (
+            "temporal_layers_2_3",
+            "temporal",
+            {"onnx": "temporal_layers_2_3.onnx", "input_names": ["hidden"]},
+        )
+    ]
+    calibration = {
+        "graphs": {
+            "temporal_layers_2_3": {
+                "onnx_sha256": "onnx-sha",
+                "samples": [{"source_id": "clean", "frame": 0}],
+            }
+        }
+    }
+
+    result = module._build_result(
+        graph_manifest_path,
+        calibration_manifest_path,
+        "auto",
+        20,
+        graph_specs,
+        calibration,
+        graph_precisions={"temporal_layers_2_3": "w8a16"},
+    )
+
+    record = result["graphs"]["temporal_layers_2_3"]
+    assert record["precision"] == "w8a16"
+    assert "lite_mp" not in record["quantize_options"]
+
+
+def test_result_seed_reuses_only_matching_quantize_and_compile_plans() -> None:
+    module = _load_script()
+    result = {
+        "calibration_manifest_sha256": "calibration-sha",
+        "target_device": {"name": "device", "os": "16"},
+        "compile_runtime": "qnn_dlc",
+        "compile_options": "--target_runtime qnn_dlc --truncate_64bit_io",
+        "graphs": {
+            "frontend": {
+                "onnx_sha256": "frontend-sha",
+                "precision": "w8a16",
+                "quantize_options": "frontend-options",
+                "status": "planned",
+            },
+            "temporal_layers_0_1": {
+                "onnx_sha256": "temporal-sha",
+                "precision": "w8a16_mixed_int16",
+                "quantize_options": "int16-options",
+                "status": "planned",
+            },
+        },
+    }
+    source = {
+        "calibration_manifest_sha256": "calibration-sha",
+        "target_device": {"name": "device", "os": "16"},
+        "compile_runtime": "qnn_dlc",
+        "compile_options": "--target_runtime qnn_dlc --truncate_64bit_io",
+        "graphs": {
+            "frontend": {
+                "onnx_sha256": "frontend-sha",
+                "precision": "w8a16",
+                "quantize_options": "frontend-options",
+                "source_model_id": "frontend-source",
+                "quantize_job_id": "frontend-quantize-job",
+                "quantized_model_id": "frontend-quantized",
+                "compile_job_id": "frontend-compile-job",
+                "compiled_model_id": "frontend-compiled",
+            },
+            "temporal_layers_0_1": {
+                "onnx_sha256": "temporal-sha",
+                "precision": "w8a16_mixed_fp16",
+                "quantize_options": "fp16-options",
+                "source_model_id": "temporal-source",
+                "quantize_job_id": "temporal-quantize-job",
+                "quantized_model_id": "temporal-quantized",
+                "compile_job_id": "temporal-compile-job",
+                "compiled_model_id": "temporal-compiled",
+            },
+        },
+    }
+
+    quantize_count, compile_count = module._seed_compatible_results(result, source)
+
+    assert (quantize_count, compile_count) == (1, 1)
+    assert result["graphs"]["frontend"]["compiled_model_id"] == "frontend-compiled"
+    temporal = result["graphs"]["temporal_layers_0_1"]
+    assert temporal["source_model_id"] == "temporal-source"
+    assert "quantize_job_id" not in temporal
+    assert "compiled_model_id" not in temporal
+
+
 class _FakeJob:
     def __init__(self, *, success: bool, failure: bool) -> None:
         self.job_id = "job-1"
