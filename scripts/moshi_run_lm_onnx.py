@@ -4,13 +4,172 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import math
+import re
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import onnxruntime as ort
 import torch
+
+CALIBRATION_FORMAT = "moshi-lm-graph-calibration-v1"
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as file:
+        for block in iter(lambda: file.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _graph_specs(manifest: dict[str, Any]) -> list[tuple[str, str, dict[str, Any]]]:
+    specs = [("frontend", "frontend", manifest["frontend"])]
+    specs.extend(
+        (Path(item["onnx"]).stem, "temporal", item)
+        for item in manifest["temporal_shards"]
+    )
+    specs.append(("head", "head", manifest["head"]))
+    specs.extend(
+        (Path(item["onnx"]).stem, "depformer", item)
+        for item in manifest["depformer"]["steps"]
+    )
+    return specs
+
+
+def _parse_frame_positions(value: str) -> list[int]:
+    try:
+        positions = sorted({int(part.strip()) for part in value.split(",")})
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "frame positions must be comma-separated integers"
+        ) from error
+    if not positions or positions[0] < 0:
+        raise argparse.ArgumentTypeError("frame positions must be non-negative")
+    return positions
+
+
+class CalibrationCapture:
+    """Persist real per-graph ORT feeds selected from sequential LM execution."""
+
+    def __init__(
+        self,
+        output_dir: Path,
+        onnx_dir: Path,
+        graph_manifest: dict[str, Any],
+        source_id: str,
+        trace_dir: Path,
+        frame_positions: list[int],
+    ) -> None:
+        self.output_dir = output_dir
+        self.source_id = source_id
+        self.frame_positions = set(frame_positions)
+        self.manifest_path = output_dir / "manifest.json"
+        self.specs = {
+            name: (kind, spec)
+            for name, kind, spec in _graph_specs(graph_manifest)
+        }
+        graph_manifest_path = onnx_dir / "manifest.json"
+        graph_manifest_sha256 = _sha256(graph_manifest_path)
+        if self.manifest_path.exists():
+            self.manifest = json.loads(self.manifest_path.read_text())
+            if self.manifest.get("format") != CALIBRATION_FORMAT:
+                raise ValueError(
+                    f"Unsupported calibration manifest: {self.manifest.get('format')}"
+                )
+            if self.manifest.get("graph_manifest_sha256") != graph_manifest_sha256:
+                raise ValueError(
+                    "Calibration directory belongs to a different ONNX graph manifest"
+                )
+        else:
+            self.manifest = {
+                "format": CALIBRATION_FORMAT,
+                "graph_manifest_sha256": graph_manifest_sha256,
+                "graphs": {},
+                "sources": [],
+            }
+
+        graphs = self.manifest["graphs"]
+        for name, (kind, spec) in self.specs.items():
+            onnx_path = onnx_dir / spec["onnx"]
+            expected = {
+                "kind": kind,
+                "onnx": spec["onnx"],
+                "onnx_sha256": _sha256(onnx_path),
+                "input_names": spec["input_names"],
+            }
+            if name in graphs:
+                for key, value in expected.items():
+                    if graphs[name].get(key) != value:
+                        raise ValueError(
+                            f"Calibration graph {name!r} changed at field {key!r}"
+                        )
+            else:
+                graphs[name] = {**expected, "samples": []}
+
+        source = {
+            "id": source_id,
+            "trace_dir": str(trace_dir.resolve()),
+            "frame_positions": frame_positions,
+        }
+        previous = next(
+            (item for item in self.manifest["sources"] if item["id"] == source_id),
+            None,
+        )
+        if previous is not None and previous != source:
+            raise ValueError(
+                f"Calibration source ID {source_id!r} already describes another trace"
+            )
+        if previous is None:
+            self.manifest["sources"].append(source)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        self._write_manifest()
+
+    def _write_manifest(self) -> None:
+        temporary = self.manifest_path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(self.manifest, indent=2) + "\n")
+        temporary.replace(self.manifest_path)
+
+    def capture(self, graph_name: str, frame: int, feed: dict[str, np.ndarray]) -> None:
+        if frame not in self.frame_positions:
+            return
+        graph = self.manifest["graphs"][graph_name]
+        if list(feed) != graph["input_names"]:
+            raise ValueError(
+                f"{graph_name} feed names {list(feed)} != {graph['input_names']}"
+            )
+        safe_source = re.sub(r"[^A-Za-z0-9_.-]+", "_", self.source_id).strip("_")
+        source_hash = hashlib.sha256(self.source_id.encode()).hexdigest()[:8]
+        safe_source = f"{safe_source or 'source'}_{source_hash}"
+        relative = Path("samples") / graph_name / f"{safe_source}_frame_{frame:04d}.npz"
+        path = self.output_dir / relative
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + ".tmp.npz")
+        np.savez_compressed(temporary, **feed)
+        temporary.replace(path)
+        sample = {
+            "source_id": self.source_id,
+            "frame": frame,
+            "file": str(relative),
+        }
+        samples = graph["samples"]
+        previous_index = next(
+            (
+                index
+                for index, item in enumerate(samples)
+                if item["source_id"] == self.source_id and item["frame"] == frame
+            ),
+            None,
+        )
+        if previous_index is None:
+            samples.append(sample)
+            samples.sort(key=lambda item: (item["source_id"], item["frame"]))
+        else:
+            samples[previous_index] = sample
+        self._write_manifest()
 
 
 def _session(path: Path) -> ort.InferenceSession:
@@ -50,6 +209,21 @@ def main() -> None:
     parser.add_argument("--trace-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--frames", type=int)
+    parser.add_argument(
+        "--calibration-dir",
+        type=Path,
+        help="Append selected real ORT feeds to this calibration dataset.",
+    )
+    parser.add_argument(
+        "--calibration-frames",
+        type=_parse_frame_positions,
+        default=_parse_frame_positions("0,1,2,4,8,16,24,37"),
+        help="Comma-separated frame positions to capture (default: 0,1,2,4,8,16,24,37).",
+    )
+    parser.add_argument(
+        "--calibration-source-id",
+        help="Stable sample source label; defaults to the trace directory name.",
+    )
     args = parser.parse_args()
     manifest_path = args.onnx_dir / "manifest.json"
     if not manifest_path.is_file():
@@ -69,13 +243,30 @@ def main() -> None:
     if frames < 2 or frames > sequence.shape[-1]:
         raise SystemExit(f"--frames must be within 2:{sequence.shape[-1]}")
     sequence = sequence[..., :frames]
+    capture = None
+    if args.calibration_dir is not None:
+        invalid = [frame for frame in args.calibration_frames if frame >= frames]
+        if invalid:
+            raise SystemExit(
+                f"Calibration frames {invalid} are unavailable in a {frames}-frame trace"
+            )
+        capture = CalibrationCapture(
+            args.calibration_dir,
+            args.onnx_dir,
+            manifest,
+            args.calibration_source_id or args.trace_dir.name,
+            args.trace_dir,
+            args.calibration_frames,
+        )
 
     frontend = manifest["frontend"]
     session = _session(args.onnx_dir / frontend["onnx"])
-    hidden_frames = [
-        session.run(frontend["output_names"], {"sequence": sequence[..., frame : frame + 1]})[0]
-        for frame in range(frames)
-    ]
+    hidden_frames = []
+    for frame in range(frames):
+        feed = {"sequence": sequence[..., frame : frame + 1]}
+        if capture is not None:
+            capture.capture("frontend", frame, feed)
+        hidden_frames.append(session.run(frontend["output_names"], feed)[0])
     del session
     gc.collect()
     print(f"frontend: PASS frames={frames}", flush=True)
@@ -87,9 +278,12 @@ def main() -> None:
         for frame, hidden in enumerate(hidden_frames):
             position = np.array([frame], dtype=np.int64)
             values = [hidden, position, *caches]
+            feed = dict(zip(shard["input_names"], values, strict=True))
+            if capture is not None:
+                capture.capture(Path(shard["onnx"]).stem, frame, feed)
             received = session.run(
                 shard["output_names"],
-                dict(zip(shard["input_names"], values, strict=True)),
+                feed,
             )
             if not all(np.isfinite(value).all() for value in received):
                 raise RuntimeError(
@@ -111,8 +305,11 @@ def main() -> None:
     session = _session(args.onnx_dir / head["onnx"])
     temporal_frames = []
     text_logits_frames = []
-    for hidden in hidden_frames:
-        temporal, text_logits = session.run(head["output_names"], {"hidden": hidden})
+    for frame, hidden in enumerate(hidden_frames):
+        feed = {"hidden": hidden}
+        if capture is not None:
+            capture.capture("head", frame, feed)
+        temporal, text_logits = session.run(head["output_names"], feed)
         temporal_frames.append(temporal)
         text_logits_frames.append(text_logits)
     del session
@@ -139,9 +336,12 @@ def main() -> None:
         next_caches = []
         for frame in range(frames):
             values = [previous_tokens[frame], temporal_frames[frame], *cache_frames[frame]]
+            feed = dict(zip(step["input_names"], values, strict=True))
+            if capture is not None:
+                capture.capture(Path(step["onnx"]).stem, frame, feed)
             received = session.run(
                 step["output_names"],
-                dict(zip(step["input_names"], values, strict=True)),
+                feed,
             )
             if not all(np.isfinite(value).all() for value in received):
                 raise RuntimeError(
@@ -196,6 +396,12 @@ def main() -> None:
     if report["text_token_agreement"] != 1.0 or report["audio_token_agreement"] != 1.0:
         raise RuntimeError(f"ONNX token mismatch against BF16 reference: {report}")
     print("Standalone ONNX LM inference and BF16 token parity: PASS", flush=True)
+    if capture is not None:
+        print(
+            f"Calibration capture: PASS dir={args.calibration_dir} "
+            f"source={capture.source_id} frames={sorted(capture.frame_positions)}",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":
