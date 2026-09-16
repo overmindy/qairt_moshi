@@ -95,6 +95,21 @@ def _batch_signature(
     return digest.hexdigest()
 
 
+def _order_samples(
+    samples: list[dict[str, np.ndarray]], input_order: list[str]
+) -> list[dict[str, np.ndarray]]:
+    expected = set(input_order)
+    ordered = []
+    for sample in samples:
+        if set(sample) != expected:
+            raise ValueError(
+                f"Inference inputs {list(sample)} do not match compiled inputs "
+                f"{input_order}"
+            )
+        ordered.append({name: sample[name] for name in input_order})
+    return ordered
+
+
 def _load_output_archive(
     path: Path, sample_count: int, output_count: int
 ) -> list[list[np.ndarray]]:
@@ -113,15 +128,15 @@ def _cloud_batch(
     model_id: str,
     device: dict[str, str],
     samples: list[dict[str, np.ndarray]],
+    input_order: list[str],
     output_names: list[str],
     stem: Path,
     retry_failed: bool,
 ) -> list[list[np.ndarray]]:
     if not samples:
         raise ValueError("Cloud inference batch cannot be empty")
-    input_names = list(samples[0])
-    if any(list(sample) != input_names for sample in samples):
-        raise ValueError("Cloud inference samples have inconsistent input names")
+    samples = _order_samples(samples, input_order)
+    input_names = input_order
     converted = [
         {name: _qnn_input(value) for name, value in sample.items()}
         for sample in samples
@@ -133,7 +148,21 @@ def _cloud_batch(
     if record_path.exists():
         record = json.loads(record_path.read_text())
         if record.get("signature") != signature:
-            raise ValueError(f"Inputs/model changed; use a new run directory: {stem}")
+            if not retry_failed or not record.get("job_id"):
+                raise ValueError(
+                    f"Inputs/model changed; use a new run directory: {stem}"
+                )
+            previous_job = hub.get_job(record["job_id"])
+            if not previous_job.get_status().failure:
+                raise ValueError(
+                    f"Inputs/model changed but the recorded job is not failed: "
+                    f"{previous_job.url}"
+                )
+            failed_job_ids = [
+                *record.get("failed_job_ids", []),
+                previous_job.job_id,
+            ]
+            record = {"failed_job_ids": list(dict.fromkeys(failed_job_ids))}
     if archive_path.exists():
         return _load_output_archive(archive_path, len(converted), len(output_names))
 
@@ -234,6 +263,26 @@ def _target_id(quantization: dict[str, Any], graph_name: str) -> str:
     if not model_id:
         raise ValueError(f"Graph {graph_name} has no compiled model ID")
     return model_id
+
+
+def _compiled_input_order(quantization: dict[str, Any], graph_name: str) -> list[str]:
+    record = quantization["graphs"].get(graph_name)
+    if record is None:
+        raise ValueError(f"Quantization manifest is missing graph {graph_name}")
+    job_id = record.get("compile_job_id")
+    if not job_id:
+        raise ValueError(f"Graph {graph_name} has no compile job ID")
+    job = hub.get_job(job_id)
+    status = job.get_status()
+    if not status.success:
+        raise ValueError(f"Compile job is not successful for {graph_name}: {job.url}")
+    input_order = list(job.get_target_shapes())
+    if set(input_order) != set(record["input_names"]):
+        raise ValueError(
+            f"Compiled inputs for {graph_name} changed: {input_order} != "
+            f"{record['input_names']}"
+        )
+    return input_order
 
 
 def _cache_report(
@@ -355,6 +404,14 @@ def main() -> None:
     device = quantization.get("target_device")
     if not isinstance(device, dict) or not device.get("name"):
         raise SystemExit("Quantization manifest has no target device")
+    compiled_input_orders: dict[str, list[str]] = {}
+
+    def input_order(graph_name: str) -> list[str]:
+        if graph_name not in compiled_input_orders:
+            compiled_input_orders[graph_name] = _compiled_input_order(
+                quantization, graph_name
+            )
+        return compiled_input_orders[graph_name]
 
     selected_sources = _select_sources(calibration, args.source_id)
     sources: list[dict[str, Any]] = []
@@ -431,6 +488,7 @@ def main() -> None:
         model_id=_target_id(quantization, frontend_name),
         device=device,
         samples=frontend_samples,
+        input_order=input_order(frontend_name),
         output_names=frontend["output_names"],
         stem=args.output_dir / "000_frontend",
         retry_failed=args.retry_failed,
@@ -510,6 +568,7 @@ def main() -> None:
                 model_id=_target_id(quantization, graph_name),
                 device=device,
                 samples=samples,
+                input_order=input_order(graph_name),
                 output_names=shard["output_names"],
                 stem=args.output_dir
                 / f"{shard_index:03d}_{graph_name}_frame_{frame:04d}",
@@ -566,6 +625,7 @@ def main() -> None:
         model_id=_target_id(quantization, head_name),
         device=device,
         samples=head_samples,
+        input_order=input_order(head_name),
         output_names=head["output_names"],
         stem=args.output_dir / "017_head",
         retry_failed=args.retry_failed,
@@ -678,6 +738,7 @@ def main() -> None:
             model_id=_target_id(quantization, graph_name),
             device=device,
             samples=samples,
+            input_order=input_order(graph_name),
             output_names=step["output_names"],
             stem=args.output_dir / f"{18 + step_index:03d}_{graph_name}",
             retry_failed=args.retry_failed,

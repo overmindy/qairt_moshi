@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 
 import numpy as np
 import pytest
@@ -65,6 +65,45 @@ def test_target_ids_use_canonical_frontend_and_head_keys() -> None:
 
     assert module._target_id(quantization, "frontend") == "frontend-model"
     assert module._target_id(quantization, "head") == "head-model"
+
+
+def test_inference_samples_follow_compiled_input_order() -> None:
+    module = _load_script()
+    samples = [
+        {
+            "hidden": np.zeros((1, 1, 4), dtype=np.float32),
+            "position": np.zeros((1,), dtype=np.int32),
+        }
+    ]
+
+    ordered = module._order_samples(samples, ["position", "hidden"])
+
+    assert list(ordered[0]) == ["position", "hidden"]
+
+
+def test_compiled_input_order_comes_from_target_shapes() -> None:
+    module = _load_script()
+    job = SimpleNamespace(
+        url="https://example.invalid/compile",
+        get_status=lambda: SimpleNamespace(success=True),
+        get_target_shapes=lambda: {
+            "position": ((1,), "int32"),
+            "hidden": ((1, 1, 4), "float32"),
+        },
+    )
+    module.hub = SimpleNamespace(get_job=lambda job_id: job)
+    quantization = {
+        "graphs": {
+            "temporal_layers_0_1": {
+                "compile_job_id": "compile-job",
+                "input_names": ["hidden", "position"],
+            }
+        }
+    }
+
+    order = module._compiled_input_order(quantization, "temporal_layers_0_1")
+
+    assert order == ["position", "hidden"]
 
 
 def test_temporal_error_summary_preserves_frame_order() -> None:
