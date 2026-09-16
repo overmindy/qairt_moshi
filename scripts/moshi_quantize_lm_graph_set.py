@@ -330,10 +330,10 @@ def _recheck_recorded_target(
     model_id_key: str,
 ) -> tuple[str, Any | None]:
     """Verify a recorded target against live job status before skipping it."""
-    if not record.get(model_id_key):
-        return "missing", None
     job_id = record.get(job_id_key)
     if not job_id:
+        if not record.get(model_id_key):
+            return "missing", None
         record.pop(model_id_key, None)
         record["status"] = f"{stage}_record_invalid"
         record["error"] = f"Recorded {model_id_key} has no associated {job_id_key}"

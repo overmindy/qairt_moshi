@@ -103,6 +103,28 @@ def test_failed_live_job_is_not_skipped() -> None:
     assert record["status"] == "quantize_failed"
 
 
+def test_failed_submitted_job_without_target_is_retried() -> None:
+    module = _load_script()
+    record = {
+        "status": "compile_submitted",
+        "compile_job_id": "job-1",
+    }
+
+    state, job = module._recheck_recorded_target(
+        _FakeHub(_FakeJob(success=False, failure=True)),
+        record,
+        stage="compile",
+        job_id_key="compile_job_id",
+        model_id_key="compiled_model_id",
+    )
+
+    assert state == "retry"
+    assert job is None
+    assert "compile_job_id" not in record
+    assert "compiled_model_id" not in record
+    assert record["status"] == "compile_failed"
+
+
 def test_successful_live_job_is_verified_before_skip() -> None:
     module = _load_script()
     record = {
