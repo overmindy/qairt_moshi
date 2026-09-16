@@ -1,5 +1,38 @@
 # Moshi Linux Migration and Experiments
 
+## Reproducible real-audio and calibration corpus
+
+Start with Hugging Face's `hf-internal-testing/librispeech_asr_dummy`: its
+single `validation` split contains 73 LibriSpeech examples in a 9.19 MB Parquet
+file. This is enough for the current real-audio ONNX smoke test and an initial
+LM calibration pass; do not download a multi-gigabyte speech corpus yet.
+
+Create ten deterministic 3-second clips. `datasets` downloads the tiny split on
+the first run and caches it:
+
+```bash
+cd /home/user/yejialei/qairt_moshi
+python scripts/moshi_prepare_calibration_audio.py \
+  --source hf-dummy \
+  --output-dir /data2/yejialei/tmp/moshi-data/tiny-v1 \
+  --clean-count 8 --overlap-count 1 --silence-count 1 \
+  --seconds 3 --seed 20260915
+```
+
+The result contains eight clean clips, one overlap clip, one silence clip,
+`smoke.jsonl`, `calibration.jsonl`, and `dataset_summary.json`. The smoke
+manifest contains only four clips; use it for the first ONNX comparison. The
+ten-clip manifest is deliberately a small initial calibration set, not a claim
+of production calibration coverage.
+
+LibriSpeech audio is 16 kHz, so the script resamples it to Moshi's required
+24 kHz. That is valid for testing control flow, cache evolution, graph wiring,
+and LM calibration from generated codes, but resampling cannot create genuine
+8--12 kHz content. Before final quantization of the Mimi encoder/decoder, add a
+small number of native 24 kHz recordings (for example LibriTTS clips plus room
+noise); the full 7.7 GB archive is still unnecessary unless measurements show
+that the small set is insufficient.
+
 ## Clean ONNX baseline: complete language-model inference
 
 Start from these three source locations:
