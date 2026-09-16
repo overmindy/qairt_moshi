@@ -47,7 +47,7 @@ def test_qnn_context_workflow_compiles_to_dlc_before_linking() -> None:
     module = _load_script()
 
     assert module.COMPILE_RUNTIME.value == "qnn_dlc"
-    assert module._compile_options() == "--target_runtime qnn_dlc"
+    assert module._compile_options() == ("--target_runtime qnn_dlc --truncate_64bit_io")
     assert "qnn_context_binary" not in module._compile_options()
 
 

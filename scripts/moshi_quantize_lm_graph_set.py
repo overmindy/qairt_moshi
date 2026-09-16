@@ -35,12 +35,13 @@ def _compile_options() -> str:
 
     A QNN context binary is not a compile target in current AI Hub clients.
     The supported flow is compile(qnn_dlc), followed by a separate link job
-    when a context binary is needed.
+    when a context binary is needed. Moshi's ONNX inputs include int64 token
+    IDs and positions, so QNN compilation must explicitly truncate 64-bit I/O.
     """
     options = COMPILE_RUNTIME.aihub_target_runtime_flag
     if options is None:
         raise RuntimeError(f"AI Hub cannot compile {COMPILE_RUNTIME.value}")
-    return options
+    return f"{options} --truncate_64bit_io"
 
 
 def _sha256(path: Path) -> str:
@@ -595,8 +596,19 @@ def main() -> None:
                 "Cannot resume with a different compile runtime: "
                 f"{existing_runtime} != {COMPILE_RUNTIME.value}"
             )
+        compile_options = _compile_options()
+        existing_compile_options = result.get("compile_options")
+        if (
+            existing_compile_options is not None
+            and existing_compile_options != compile_options
+        ):
+            raise SystemExit(
+                "Cannot resume with different compile options: "
+                f"{existing_compile_options!r} != {compile_options!r}"
+            )
         result["target_device"] = requested_target
         result["compile_runtime"] = COMPILE_RUNTIME.value
+        result["compile_options"] = compile_options
         _write_json(result_path, result)
 
     if args.dry_run:
@@ -758,9 +770,10 @@ def main() -> None:
                             f"moshi-{name}-{record['precision']}-"
                             f"{COMPILE_RUNTIME.value.replace('_', '-')}"
                         ),
-                        options=_compile_options(),
+                        options=result["compile_options"],
                     )
                     record["compile_runtime"] = COMPILE_RUNTIME.value
+                    record["compile_options"] = result["compile_options"]
                     record["compile_job_id"] = job.job_id
                     record["status"] = "compile_submitted"
                     _write_json(result_path, result)
