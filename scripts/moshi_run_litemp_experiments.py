@@ -7,7 +7,7 @@ import json
 import subprocess
 import sys
 import time
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -221,7 +221,7 @@ def main() -> None:
         "target_device": args.target_device,
         "target_os": args.target_os,
         "frames": args.frames,
-        "started_at": datetime.now(UTC).isoformat(),
+        "started_at": datetime.now(timezone.utc).isoformat(),
         "variants": [],
     }
     result_path = args.output_root / "experiments.json"
@@ -344,7 +344,7 @@ def main() -> None:
         _write_json(result_path, result)
         _write_markdown(markdown_path, result)
 
-    result["finished_at"] = datetime.now(UTC).isoformat()
+    result["finished_at"] = datetime.now(timezone.utc).isoformat()
     _write_json(result_path, result)
     _write_markdown(markdown_path, result)
     print(f"\nAll variants attempted. Summary: {markdown_path}", flush=True)
