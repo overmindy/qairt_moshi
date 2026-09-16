@@ -117,3 +117,68 @@ def test_successful_live_job_is_verified_before_skip() -> None:
     assert job is not None
     assert record["quantized_model_id"] == "model-1"
     assert record["status"] == "quantize_succeeded"
+
+
+def test_preflight_receipt_uses_fast_file_stamps(tmp_path: Path) -> None:
+    module = _load_script()
+    onnx_dir = tmp_path / "onnx"
+    calibration_dir = tmp_path / "calibration"
+    onnx_dir.mkdir()
+    calibration_dir.mkdir()
+    (onnx_dir / "frontend.onnx").write_bytes(b"onnx")
+    sample_path = calibration_dir / "sample.npz"
+    sample_path.write_bytes(b"calibration")
+    graph_specs = [
+        (
+            "frontend",
+            "frontend",
+            {"onnx": "frontend.onnx", "input_names": ["sequence"]},
+        )
+    ]
+    calibration = {
+        "graphs": {
+            "frontend": {
+                "samples": [{"file": "sample.npz"}],
+            }
+        }
+    }
+    planned = {
+        "graph_manifest_sha256": "graph-sha",
+        "calibration_manifest_sha256": "calibration-sha",
+    }
+    receipt = module._build_preflight_receipt(
+        onnx_dir,
+        calibration_dir,
+        graph_specs,
+        calibration,
+        planned,
+        2,
+        "full",
+    )
+
+    matches, reason = module._preflight_receipt_matches(
+        receipt,
+        onnx_dir,
+        calibration_dir,
+        graph_specs,
+        calibration,
+        planned,
+        2,
+    )
+
+    assert matches
+    assert "unchanged" in reason
+
+    sample_path.write_bytes(b"changed-calibration-size")
+    matches, reason = module._preflight_receipt_matches(
+        receipt,
+        onnx_dir,
+        calibration_dir,
+        graph_specs,
+        calibration,
+        planned,
+        2,
+    )
+
+    assert not matches
+    assert "size/mtime changed" in reason

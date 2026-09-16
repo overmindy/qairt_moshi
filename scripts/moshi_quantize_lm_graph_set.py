@@ -12,6 +12,7 @@ import gc
 import hashlib
 import json
 import sys
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,7 @@ from qai_hub_models import Precision
 GRAPH_SET_FORMAT = "moshi-lm-onnx-graph-set-v1"
 CALIBRATION_FORMAT = "moshi-lm-graph-calibration-v1"
 RESULT_FORMAT = "moshi-lm-ai-hub-quantization-v1"
+PREFLIGHT_RECEIPT_VERSION = 1
 
 
 def _sha256(path: Path) -> str:
@@ -39,6 +41,81 @@ def _write_json(path: Path, value: dict[str, Any]) -> None:
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, indent=2) + "\n")
     temporary.replace(path)
+
+
+def _file_stamp(path: Path) -> dict[str, int]:
+    stat = path.stat()
+    return {"size": stat.st_size, "mtime_ns": stat.st_mtime_ns}
+
+
+def _preflight_file_stamps(
+    onnx_dir: Path,
+    calibration_dir: Path,
+    graph_specs: list[tuple[str, str, dict[str, Any]]],
+    calibration: dict[str, Any],
+) -> dict[str, dict[str, dict[str, int]]]:
+    onnx_files = {
+        spec["onnx"]: _file_stamp(onnx_dir / spec["onnx"])
+        for _, _, spec in graph_specs
+    }
+    calibration_files = {
+        sample["file"]: _file_stamp(calibration_dir / sample["file"])
+        for graph in calibration["graphs"].values()
+        for sample in graph.get("samples", [])
+    }
+    return {"onnx": onnx_files, "calibration": calibration_files}
+
+
+def _build_preflight_receipt(
+    onnx_dir: Path,
+    calibration_dir: Path,
+    graph_specs: list[tuple[str, str, dict[str, Any]]],
+    calibration: dict[str, Any],
+    planned: dict[str, Any],
+    minimum_sources: int,
+    validation: str,
+) -> dict[str, Any]:
+    return {
+        "version": PREFLIGHT_RECEIPT_VERSION,
+        "graph_manifest_sha256": planned["graph_manifest_sha256"],
+        "calibration_manifest_sha256": planned["calibration_manifest_sha256"],
+        "minimum_sources": minimum_sources,
+        "validation": validation,
+        "files": _preflight_file_stamps(
+            onnx_dir, calibration_dir, graph_specs, calibration
+        ),
+    }
+
+
+def _preflight_receipt_matches(
+    receipt: dict[str, Any] | None,
+    onnx_dir: Path,
+    calibration_dir: Path,
+    graph_specs: list[tuple[str, str, dict[str, Any]]],
+    calibration: dict[str, Any],
+    planned: dict[str, Any],
+    minimum_sources: int,
+) -> tuple[bool, str]:
+    if receipt is None:
+        return False, "no cached receipt"
+    expected = {
+        "version": PREFLIGHT_RECEIPT_VERSION,
+        "graph_manifest_sha256": planned["graph_manifest_sha256"],
+        "calibration_manifest_sha256": planned["calibration_manifest_sha256"],
+        "minimum_sources": minimum_sources,
+    }
+    for key, value in expected.items():
+        if receipt.get(key) != value:
+            return False, f"cached {key} changed"
+    try:
+        current_files = _preflight_file_stamps(
+            onnx_dir, calibration_dir, graph_specs, calibration
+        )
+    except FileNotFoundError as error:
+        return False, f"file disappeared: {error.filename}"
+    if receipt.get("files") != current_files:
+        return False, "an ONNX or calibration file size/mtime changed"
+    return True, "manifest hashes and file stamps unchanged"
 
 
 def _graph_specs(manifest: dict[str, Any]) -> list[tuple[str, str, dict[str, Any]]]:
@@ -115,6 +192,8 @@ def _validate_calibration(
     calibration: dict[str, Any],
     graph_specs: list[tuple[str, str, dict[str, Any]]],
     minimum_sources: int,
+    *,
+    inspect_arrays: bool = True,
 ) -> None:
     sources = calibration.get("sources", [])
     if len(sources) < minimum_sources:
@@ -122,7 +201,7 @@ def _validate_calibration(
             f"Calibration has {len(sources)} sources; at least {minimum_sources} required"
         )
     expected_sources = {item["id"] for item in sources}
-    for name, _, spec in graph_specs:
+    for graph_index, (name, _, spec) in enumerate(graph_specs, start=1):
         graph = calibration["graphs"].get(name)
         if graph is None:
             raise ValueError(f"Calibration is missing graph {name}")
@@ -149,11 +228,19 @@ def _validate_calibration(
             raise ValueError(
                 f"Calibration sample mismatch for {name}: missing={missing}, extra={extra}"
             )
+        if inspect_arrays:
+            print(
+                f"[preflight] calibration {graph_index}/{len(graph_specs)}: "
+                f"{name} ({len(samples)} samples)",
+                flush=True,
+            )
         input_signatures: dict[str, tuple[tuple[int, ...], str]] | None = None
         for sample in samples:
             path = calibration_dir / sample["file"]
             if not path.is_file():
                 raise ValueError(f"Missing calibration sample {path}")
+            if not inspect_arrays:
+                continue
             with np.load(path) as arrays:
                 if arrays.files != graph["input_names"]:
                     raise ValueError(
@@ -348,6 +435,11 @@ def main() -> None:
     parser.add_argument("--minimum-sources", type=int, default=2)
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
+        "--refresh-preflight",
+        action="store_true",
+        help="Ignore the cached receipt and fully re-hash/decompress every input.",
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Validate inputs and write the complete job plan without using AI Hub.",
@@ -372,16 +464,6 @@ def main() -> None:
         raise SystemExit("Calibration does not match the ONNX graph manifest")
 
     graph_specs = _graph_specs(graph_manifest)
-    _validate_calibration(
-        args.calibration_dir, calibration, graph_specs, args.minimum_sources
-    )
-    for name, _, spec in graph_specs:
-        onnx_path = args.onnx_dir / spec["onnx"]
-        actual_sha256 = _sha256(onnx_path)
-        expected_sha256 = calibration["graphs"][name]["onnx_sha256"]
-        if actual_sha256 != expected_sha256:
-            raise SystemExit(f"ONNX SHA256 changed for {name}: {onnx_path}")
-
     planned = _build_result(
         graph_manifest_path,
         calibration_manifest_path,
@@ -391,7 +473,8 @@ def main() -> None:
         calibration,
     )
     result_path = args.output_dir / "quantization_manifest.json"
-    if result_path.exists():
+    result_exists = result_path.exists()
+    if result_exists:
         if not args.resume:
             raise SystemExit(f"{result_path} exists; pass --resume to continue it")
         result = json.loads(result_path.read_text())
@@ -401,7 +484,88 @@ def main() -> None:
             raise SystemExit("Use an empty --output-dir or pass --resume")
         args.output_dir.mkdir(parents=True, exist_ok=True)
         result = planned
-        _write_json(result_path, result)
+
+    preflight_start = time.monotonic()
+    preflight_cached = False
+    if args.resume and not args.refresh_preflight:
+        receipt = result.get("preflight_receipt")
+        receipt_matches, receipt_reason = _preflight_receipt_matches(
+            receipt,
+            args.onnx_dir,
+            args.calibration_dir,
+            graph_specs,
+            calibration,
+            planned,
+            args.minimum_sources,
+        )
+        if receipt_matches:
+            preflight_cached = True
+            print(
+                f"[preflight] cache HIT: {receipt_reason}",
+                flush=True,
+            )
+        elif receipt is None and result_exists:
+            print(
+                "[preflight] bootstrapping a receipt from the existing result; "
+                "use --refresh-preflight for a forced full rescan",
+                flush=True,
+            )
+            _validate_calibration(
+                args.calibration_dir,
+                calibration,
+                graph_specs,
+                args.minimum_sources,
+                inspect_arrays=False,
+            )
+            result["preflight_receipt"] = _build_preflight_receipt(
+                args.onnx_dir,
+                args.calibration_dir,
+                graph_specs,
+                calibration,
+                planned,
+                args.minimum_sources,
+                "legacy_result_bootstrap",
+            )
+            preflight_cached = True
+        else:
+            print(f"[preflight] cache MISS: {receipt_reason}", flush=True)
+
+    if not preflight_cached:
+        print(
+            "[preflight] full validation: decompressing calibration arrays",
+            flush=True,
+        )
+        _validate_calibration(
+            args.calibration_dir,
+            calibration,
+            graph_specs,
+            args.minimum_sources,
+        )
+        for graph_index, (name, _, spec) in enumerate(graph_specs, start=1):
+            onnx_path = args.onnx_dir / spec["onnx"]
+            print(
+                f"[preflight] ONNX SHA256 {graph_index}/{len(graph_specs)}: {name}",
+                flush=True,
+            )
+            actual_sha256 = _sha256(onnx_path)
+            expected_sha256 = calibration["graphs"][name]["onnx_sha256"]
+            if actual_sha256 != expected_sha256:
+                raise SystemExit(f"ONNX SHA256 changed for {name}: {onnx_path}")
+        result["preflight_receipt"] = _build_preflight_receipt(
+            args.onnx_dir,
+            args.calibration_dir,
+            graph_specs,
+            calibration,
+            planned,
+            args.minimum_sources,
+            "full",
+        )
+
+    _write_json(result_path, result)
+    print(
+        f"[preflight] ready in {time.monotonic() - preflight_start:.2f}s",
+        flush=True,
+    )
 
     requested_target = None
     if args.target_device:
