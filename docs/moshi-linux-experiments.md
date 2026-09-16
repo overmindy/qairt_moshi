@@ -8,7 +8,10 @@ file. This is enough for the current real-audio ONNX smoke test and an initial
 LM calibration pass; do not download a multi-gigabyte speech corpus yet.
 
 Create ten deterministic 3-second clips. `datasets` downloads the tiny split on
-the first run and caches it:
+the first run and caches it. The script uses `Audio(decode=False)` to read the
+embedded FLAC bytes, then `/usr/bin/ffmpeg` converts them through stdin to
+24 kHz mono PCM16. This intentionally bypasses TorchCodec, so Torch 2.6 and its
+compatible TorchCodec version do not need to change:
 
 ```bash
 cd /home/user/yejialei/qairt_moshi

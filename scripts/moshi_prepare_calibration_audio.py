@@ -6,6 +6,7 @@ import argparse
 import hashlib
 import json
 import random
+import subprocess
 import sys
 import wave
 from array import array
@@ -19,6 +20,7 @@ HF_DUMMY_CONFIG = "clean"
 HF_DUMMY_URL = f"https://huggingface.co/datasets/{HF_DUMMY_NAME}"
 LIBRISPEECH_URL = "https://www.openslr.org/12/"
 DATASET_LICENSE = "CC BY 4.0 (LibriSpeech source corpus)"
+DEFAULT_FFMPEG_PATH = Path("/usr/bin/ffmpeg")
 
 
 def _read_wav(path: Path) -> array:
@@ -113,42 +115,68 @@ def _write_jsonl(path: Path, entries: list[dict[str, object]]) -> None:
     )
 
 
-def _decoder_to_pcm16(decoder: object) -> array:
-    """Decode a datasets 4.x AudioDecoder after its 24 kHz cast."""
-    samples = decoder.get_all_samples()  # type: ignore[attr-defined]
-    if int(samples.sample_rate) != SAMPLE_RATE:
-        raise ValueError(f"Expected {SAMPLE_RATE} Hz, got {samples.sample_rate}")
-    data = samples.data.detach().cpu().float()
-    if data.ndim == 2:
-        data = data.mean(dim=0)
-    if data.ndim != 1:
-        raise ValueError(f"Expected mono audio, got shape {tuple(data.shape)}")
-    # Avoid relying on NumPy: PyTorch and datasets are already dependencies.
-    return array(
-        "h",
-        (
-            max(-32768, min(32767, round(value * 32767)))
-            for value in data.clamp(-1, 1).tolist()
-        ),
+def _decode_audio_bytes(
+    encoded_audio: bytes, ffmpeg_path: Path, source_id: str
+) -> array:
+    """Decode encoded audio to little-endian, mono, 24 kHz PCM16 with FFmpeg."""
+    if not encoded_audio:
+        raise ValueError(f"{source_id}: empty encoded audio")
+    if not ffmpeg_path.is_file():
+        raise FileNotFoundError(f"FFmpeg executable not found: {ffmpeg_path}")
+    result = subprocess.run(
+        [
+            str(ffmpeg_path),
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            "pipe:0",
+            "-f",
+            "s16le",
+            "-acodec",
+            "pcm_s16le",
+            "-ac",
+            "1",
+            "-ar",
+            str(SAMPLE_RATE),
+            "pipe:1",
+        ],
+        input=encoded_audio,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
     )
+    if result.returncode != 0:
+        message = result.stderr.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(f"{source_id}: FFmpeg decode failed: {message}")
+    if not result.stdout or len(result.stdout) % 2:
+        raise RuntimeError(
+            f"{source_id}: FFmpeg returned invalid PCM16 byte count "
+            f"{len(result.stdout)}"
+        )
+    samples = array("h")
+    samples.frombytes(result.stdout)
+    if sys.byteorder != "little":
+        samples.byteswap()
+    return samples
 
 
 def _load_hf_dummy(
-    count: int, seed: int
+    count: int, seed: int, ffmpeg_path: Path
 ) -> tuple[list[dict[str, object]], dict[str, str]]:
     try:
         from datasets import Audio, load_dataset
     except ImportError as error:
         raise SystemExit(
-            "The tiny Hugging Face dataset path needs `datasets` and its audio "
-            "dependencies. Install the repository requirements first."
+            "The tiny Hugging Face dataset path needs `datasets`. TorchCodec is "
+            "not used because audio decoding is disabled."
         ) from error
 
     dataset = load_dataset(
         HF_DUMMY_NAME,
         HF_DUMMY_CONFIG,
         split="validation",
-    ).cast_column("audio", Audio(sampling_rate=SAMPLE_RATE))
+    ).cast_column("audio", Audio(decode=False))
     if count > len(dataset):
         raise SystemExit(
             f"Requested {count} clean clips, but dummy set has {len(dataset)}"
@@ -158,12 +186,27 @@ def _load_hf_dummy(
     rows: list[dict[str, object]] = []
     for index in indices[:count]:
         row = dataset[index]
+        source_id = str(row["id"])
+        audio = row["audio"]
+        if not isinstance(audio, dict):
+            raise RuntimeError(
+                f"{source_id}: expected decode=False audio mapping, got "
+                f"{type(audio).__name__}"
+            )
+        encoded_audio = audio.get("bytes")
+        if not isinstance(encoded_audio, bytes):
+            raise RuntimeError(
+                f"{source_id}: expected embedded audio bytes, got "
+                f"{type(encoded_audio).__name__}"
+            )
         rows.append(
             {
-                "samples": _decoder_to_pcm16(row["audio"]),
+                "samples": _decode_audio_bytes(
+                    encoded_audio, ffmpeg_path, source_id
+                ),
                 "speaker": str(row["speaker_id"]),
                 "transcript": str(row["text"]),
-                "source": str(row["id"]),
+                "source": source_id,
             }
         )
     return rows, {
@@ -213,6 +256,7 @@ def main() -> None:
         "--source", choices=("hf-dummy", "libritts"), default="hf-dummy"
     )
     parser.add_argument("--source-dir", type=Path)
+    parser.add_argument("--ffmpeg-path", type=Path, default=DEFAULT_FFMPEG_PATH)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--clean-count", type=int, default=8)
     parser.add_argument("--overlap-count", type=int, default=1)
@@ -231,7 +275,9 @@ def main() -> None:
 
     rng = random.Random(args.seed)
     if args.source == "hf-dummy":
-        rows, provenance = _load_hf_dummy(args.clean_count, args.seed)
+        rows, provenance = _load_hf_dummy(
+            args.clean_count, args.seed, args.ffmpeg_path
+        )
     else:
         if args.source_dir is None:
             raise SystemExit("--source-dir is required with --source libritts")
