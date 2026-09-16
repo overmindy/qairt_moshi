@@ -414,7 +414,7 @@ def main() -> None:
     )
 
     frontend = graph["frontend"]
-    frontend_name = Path(frontend["onnx"]).stem
+    frontend_name = "frontend"
     session = _session(args.onnx_dir / frontend["onnx"])
     cpu_hidden: dict[str, list[np.ndarray]] = {source["id"]: [] for source in sources}
     frontend_samples = []
@@ -547,7 +547,7 @@ def main() -> None:
         gc.collect()
 
     head = graph["head"]
-    head_name = Path(head["onnx"]).stem
+    head_name = "head"
     session = _session(args.onnx_dir / head["onnx"])
     head_samples = []
     sample_keys = []

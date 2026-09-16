@@ -54,6 +54,19 @@ def test_default_sources_select_clean_and_overlap() -> None:
     assert [source["id"] for source in selected] == ["clean-000", "overlap-000"]
 
 
+def test_target_ids_use_canonical_frontend_and_head_keys() -> None:
+    module = _load_script()
+    quantization = {
+        "graphs": {
+            "frontend": {"compiled_model_id": "frontend-model"},
+            "head": {"compiled_model_id": "head-model"},
+        }
+    }
+
+    assert module._target_id(quantization, "frontend") == "frontend-model"
+    assert module._target_id(quantization, "head") == "head-model"
+
+
 def test_temporal_error_summary_preserves_frame_order() -> None:
     module = _load_script()
     records = [
