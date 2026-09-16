@@ -201,11 +201,64 @@ def _input_specs(calibration_dir: Path, graph: dict[str, Any]) -> dict[str, Any]
         }
 
 
+def _status_summary(status: Any) -> str:
+    state = getattr(status, "state", None)
+    state_name = getattr(state, "name", None) or getattr(status, "code", None)
+    message = getattr(status, "message", None)
+    return f"{state_name or 'UNKNOWN'}{f': {message}' if message else ''}"
+
+
 def _required_target_model(job: Any, stage: str) -> Any:
+    status = job.get_status()
+    if not status.success:
+        raise RuntimeError(
+            f"{stage} job did not succeed ({_status_summary(status)}): {job.url}"
+        )
     target = job.get_target_model()
     if target is None:
         raise RuntimeError(f"{stage} job produced no target model: {job.url}")
     return target
+
+
+def _recheck_recorded_target(
+    hub: Any,
+    record: dict[str, Any],
+    *,
+    stage: str,
+    job_id_key: str,
+    model_id_key: str,
+) -> tuple[str, Any | None]:
+    """Verify a recorded target against live job status before skipping it."""
+    if not record.get(model_id_key):
+        return "missing", None
+    job_id = record.get(job_id_key)
+    if not job_id:
+        record.pop(model_id_key, None)
+        record["status"] = f"{stage}_record_invalid"
+        record["error"] = f"Recorded {model_id_key} has no associated {job_id_key}"
+        return "retry", None
+
+    job = hub.get_job(job_id)
+    status = job.get_status()
+    record[f"{stage}_live_status"] = _status_summary(status)
+    if status.success:
+        target = _required_target_model(job, stage.capitalize())
+        record[model_id_key] = target.model_id
+        record["status"] = f"{stage}_succeeded"
+        record.pop("error", None)
+        return "success", job
+    if status.failure:
+        record.pop(model_id_key, None)
+        record.pop(job_id_key, None)
+        record["status"] = f"{stage}_failed"
+        record["error"] = (
+            f"Recorded {stage} job failed: {_status_summary(status)}"
+        )
+        return "retry", None
+
+    record.pop(model_id_key, None)
+    record["status"] = f"{stage}_submitted"
+    return "running", job
 
 
 def _build_result(
@@ -385,12 +438,30 @@ def main() -> None:
     failures: list[str] = []
     for name, _, spec in graph_specs:
         record = result["graphs"][name]
-        if record.get("quantized_model_id"):
-            print(f"quantize skip complete: {name}", flush=True)
+        target_state, recorded_job = _recheck_recorded_target(
+            hub,
+            record,
+            stage="quantize",
+            job_id_key="quantize_job_id",
+            model_id_key="quantized_model_id",
+        )
+        if target_state == "success":
+            print(f"quantize skip verified success: {name}", flush=True)
+            _write_json(result_path, result)
+            continue
+        if target_state == "running":
+            assert recorded_job is not None
+            active_quantize_jobs[name] = recorded_job
+            print(
+                f"quantize resume running: {name} job={recorded_job.job_id}",
+                flush=True,
+            )
+            _write_json(result_path, result)
             continue
         if record.get("status") in {
             "quantize_submit_failed",
             "quantize_failed",
+            "quantize_record_invalid",
         }:
             record.pop("quantize_job_id", None)
             record.pop("error", None)
@@ -463,11 +534,32 @@ def main() -> None:
         device = hub.Device(**device_args)
         for name, _, _ in graph_specs:
             record = result["graphs"][name]
-            if not record.get("quantized_model_id") or record.get("compiled_model_id"):
+            if not record.get("quantized_model_id"):
+                continue
+            target_state, recorded_job = _recheck_recorded_target(
+                hub,
+                record,
+                stage="compile",
+                job_id_key="compile_job_id",
+                model_id_key="compiled_model_id",
+            )
+            if target_state == "success":
+                print(f"compile skip verified success: {name}", flush=True)
+                _write_json(result_path, result)
+                continue
+            if target_state == "running":
+                assert recorded_job is not None
+                active_compile_jobs[name] = recorded_job
+                print(
+                    f"compile resume running: {name} job={recorded_job.job_id}",
+                    flush=True,
+                )
+                _write_json(result_path, result)
                 continue
             if record.get("status") in {
                 "compile_submit_failed",
                 "compile_failed",
+                "compile_record_invalid",
             }:
                 record.pop("compile_job_id", None)
                 record.pop("error", None)
