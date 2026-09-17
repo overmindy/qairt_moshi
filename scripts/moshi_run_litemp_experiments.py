@@ -106,13 +106,17 @@ def _load_probe_summary(path: Path) -> dict[str, float | None] | None:
     hidden_metrics = [
         sample["outputs"]["output_hidden"]
         for sample in samples
-        if "output_hidden" in sample.get("outputs", {})
+        if isinstance(
+            sample.get("outputs", {}).get("output_hidden", {}).get("relative_rms"),
+            (int, float),
+        )
     ]
     cache_metrics = [
         output
         for sample in samples
         for name, output in sample.get("outputs", {}).items()
         if name != "output_hidden"
+        and isinstance(output.get("relative_rms"), (int, float))
     ]
     all_metrics = [*hidden_metrics, *cache_metrics]
     if not all_metrics:
@@ -124,9 +128,7 @@ def _load_probe_summary(path: Path) -> dict[str, float | None] | None:
         "max_cache_relative_rms": max(
             (metric["relative_rms"] for metric in cache_metrics), default=None
         ),
-        "max_relative_rms": max(
-            metric["relative_rms"] for metric in all_metrics
-        ),
+        "max_relative_rms": max(metric["relative_rms"] for metric in all_metrics),
         "max_abs": max(metric["max_abs"] for metric in all_metrics),
     }
 
@@ -179,9 +181,7 @@ def _write_markdown(path: Path, result: dict[str, Any]) -> None:
                 quantize=_step_state(variant["steps"], "quantize_compile"),
                 inspect=_step_state(variant["steps"], "inspect_qdq"),
                 probe=_step_state(variant["steps"], "single_graph_probe"),
-                hidden_rms=(
-                    f"{hidden_rms:.6g}" if hidden_rms is not None else "-"
-                ),
+                hidden_rms=(f"{hidden_rms:.6g}" if hidden_rms is not None else "-"),
                 cache_rms=f"{cache_rms:.6g}" if cache_rms is not None else "-",
                 chain=_step_state(variant["steps"], "chained_validation"),
                 agreement=(
@@ -194,9 +194,7 @@ def _write_markdown(path: Path, result: dict[str, Any]) -> None:
     lines.extend(
         [
             "",
-            "A failed step never stops the next variant. Inspect each variant's "
-            "`experiment.log`, probe `report.json`, QDQ `qdq_report.json`, and "
-            "chained validation `report.json` for details.",
+            "A failed step never stops the next variant. Inspect each variant's `experiment.log`, probe `report.json`, QDQ `qdq_report.json`, and chained validation `report.json` for details.",
             "",
         ]
     )

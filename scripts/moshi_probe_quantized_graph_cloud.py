@@ -49,6 +49,36 @@ def _session(path: Path) -> ort.InferenceSession:
     )
 
 
+def _finite_counts(value: np.ndarray) -> dict[str, int]:
+    array = np.asarray(value)
+    return {
+        "elements": int(array.size),
+        "finite": int(np.count_nonzero(np.isfinite(array))),
+        "nan": int(np.count_nonzero(np.isnan(array))),
+        "positive_inf": int(np.count_nonzero(np.isposinf(array))),
+        "negative_inf": int(np.count_nonzero(np.isneginf(array))),
+    }
+
+
+def _probe_metrics(actual: np.ndarray, reference: np.ndarray) -> dict[str, Any]:
+    actual_counts = _finite_counts(actual)
+    reference_counts = _finite_counts(reference)
+    finite = (
+        actual_counts["finite"] == actual_counts["elements"]
+        and reference_counts["finite"] == reference_counts["elements"]
+    )
+    if finite:
+        return {"finite": True, **_metrics(actual, reference)}
+    return {
+        "finite": False,
+        "relative_rms": None,
+        "rmse": None,
+        "max_abs": None,
+        "actual_counts": actual_counts,
+        "reference_counts": reference_counts,
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--onnx-dir", type=Path, required=True)
@@ -82,9 +112,7 @@ def main() -> None:
         raise SystemExit("Calibration does not match the ONNX graph manifest")
     if quantization.get("graph_manifest_sha256") != _sha256(graph_path):
         raise SystemExit("Quantized models do not match the ONNX graph manifest")
-    if quantization.get("calibration_manifest_sha256") != _sha256(
-        calibration_path
-    ):
+    if quantization.get("calibration_manifest_sha256") != _sha256(calibration_path):
         raise SystemExit("Quantized models do not match the calibration manifest")
 
     spec = _graph_specs(graph_manifest).get(args.graph)
@@ -125,7 +153,7 @@ def main() -> None:
         stem=args.output_dir / args.graph,
         retry_failed=args.retry_failed,
     )
-    report = {
+    report: dict[str, Any] = {
         "format": "moshi-lm-quantized-graph-probe-v1",
         "graph": args.graph,
         "samples": [
@@ -133,7 +161,7 @@ def main() -> None:
                 "source_id": sample["source_id"],
                 "frame": sample["frame"],
                 "outputs": {
-                    name: _metrics(received, reference)
+                    name: _probe_metrics(received, reference)
                     for name, received, reference in zip(
                         spec["output_names"], cloud_outputs, cpu_outputs, strict=True
                     )
@@ -144,8 +172,27 @@ def main() -> None:
             )
         ],
     }
+    nonfinite_outputs = [
+        {
+            "source_id": sample["source_id"],
+            "frame": sample["frame"],
+            "output": name,
+            "actual_counts": metrics["actual_counts"],
+            "reference_counts": metrics["reference_counts"],
+        }
+        for sample in report["samples"]
+        for name, metrics in sample["outputs"].items()
+        if not metrics["finite"]
+    ]
+    report["nonfinite_outputs"] = nonfinite_outputs
+    report["passed"] = not nonfinite_outputs
     _write_json(args.output_dir / "report.json", report)
     print(json.dumps(report, indent=2), flush=True)
+    if nonfinite_outputs:
+        raise RuntimeError(
+            f"Cloud output contains NaN or Inf; inspect "
+            f"{args.output_dir / 'report.json'}"
+        )
     print(f"Single-graph cloud probe: PASS graph={args.graph}", flush=True)
 
 
