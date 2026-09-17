@@ -98,20 +98,36 @@ def _step_state(steps: list[dict[str, Any]], step_name: str) -> str:
     return "PASS" if step["passed"] else f"FAIL ({step['return_code']})"
 
 
-def _load_probe_summary(path: Path) -> dict[str, float] | None:
+def _load_probe_summary(path: Path) -> dict[str, float | None] | None:
     if not path.is_file():
         return None
     report = json.loads(path.read_text())
-    metrics = [
-        output
-        for sample in report.get("samples", [])
-        for output in sample.get("outputs", {}).values()
+    samples = report.get("samples", [])
+    hidden_metrics = [
+        sample["outputs"]["output_hidden"]
+        for sample in samples
+        if "output_hidden" in sample.get("outputs", {})
     ]
-    if not metrics:
+    cache_metrics = [
+        output
+        for sample in samples
+        for name, output in sample.get("outputs", {}).items()
+        if name != "output_hidden"
+    ]
+    all_metrics = [*hidden_metrics, *cache_metrics]
+    if not all_metrics:
         return None
     return {
-        "max_relative_rms": max(metric["relative_rms"] for metric in metrics),
-        "max_abs": max(metric["max_abs"] for metric in metrics),
+        "max_hidden_relative_rms": max(
+            (metric["relative_rms"] for metric in hidden_metrics), default=None
+        ),
+        "max_cache_relative_rms": max(
+            (metric["relative_rms"] for metric in cache_metrics), default=None
+        ),
+        "max_relative_rms": max(
+            metric["relative_rms"] for metric in all_metrics
+        ),
+        "max_abs": max(metric["max_abs"] for metric in all_metrics),
     }
 
 
@@ -146,23 +162,27 @@ def _write_markdown(path: Path, result: dict[str, Any]) -> None:
         "",
         f"Graph: `{result['graph']}`",
         "",
-        "| Variant | Quantize/compile | QDQ inspect | Graph probe | Probe max rel RMS | 4-frame chain | Token agreement text/audio |",
-        "|---|---:|---:|---:|---:|---:|---:|",
+        "| Variant | Quantize/compile | QDQ inspect | Graph probe | Hidden max rel RMS | Cache max rel RMS | 4-frame chain | Token agreement text/audio |",
+        "|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for variant in result["variants"]:
         probe_summary = variant.get("probe_summary") or {}
         chain_summary = variant.get("chain_summary") or {}
-        probe_rms = probe_summary.get("max_relative_rms")
+        hidden_rms = probe_summary.get("max_hidden_relative_rms")
+        cache_rms = probe_summary.get("max_cache_relative_rms")
         text_agreement = chain_summary.get("minimum_text_token_agreement")
         audio_agreement = chain_summary.get("minimum_audio_token_agreement")
         lines.append(
-            "| {name} | {quantize} | {inspect} | {probe} | {probe_rms} | "
-            "{chain} | {agreement} |".format(
+            "| {name} | {quantize} | {inspect} | {probe} | {hidden_rms} | "
+            "{cache_rms} | {chain} | {agreement} |".format(
                 name=variant["name"],
                 quantize=_step_state(variant["steps"], "quantize_compile"),
                 inspect=_step_state(variant["steps"], "inspect_qdq"),
                 probe=_step_state(variant["steps"], "single_graph_probe"),
-                probe_rms=(f"{probe_rms:.6g}" if probe_rms is not None else "-"),
+                hidden_rms=(
+                    f"{hidden_rms:.6g}" if hidden_rms is not None else "-"
+                ),
+                cache_rms=f"{cache_rms:.6g}" if cache_rms is not None else "-",
                 chain=_step_state(variant["steps"], "chained_validation"),
                 agreement=(
                     f"{text_agreement:.6g}/{audio_agreement:.6g}"
