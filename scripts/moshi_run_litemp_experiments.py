@@ -196,6 +196,21 @@ def main() -> None:
     parser.add_argument("--frames", type=int, default=4)
     parser.add_argument("--minimum-sources", type=int, default=2)
     parser.add_argument("--keep-downloaded-models", action="store_true")
+    parser.add_argument(
+        "--variant",
+        action="append",
+        help="Run only this named variant. Repeat to select multiple variants.",
+    )
+    parser.add_argument(
+        "--probe-only",
+        action="store_true",
+        help="Stop each variant after the direct single-graph runtime probe.",
+    )
+    parser.add_argument(
+        "--skip-qdq-inspection",
+        action="store_true",
+        help="Skip downloading and inspecting the quantized ONNX model.",
+    )
     args = parser.parse_args()
     if args.frames < 2:
         raise SystemExit("--frames must be at least two")
@@ -227,7 +242,21 @@ def main() -> None:
     result_path = args.output_root / "experiments.json"
     markdown_path = args.output_root / "RESULTS.md"
 
-    for variant in _variants(args.graph):
+    variants = _variants(args.graph)
+    available_variants = {variant["name"] for variant in variants}
+    if args.variant:
+        unknown_variants = sorted(set(args.variant) - available_variants)
+        if unknown_variants:
+            raise SystemExit(
+                f"Unknown variants {unknown_variants}; "
+                f"choose from {sorted(available_variants)}"
+            )
+        requested_variants = set(args.variant)
+        variants = [
+            variant for variant in variants if variant["name"] in requested_variants
+        ]
+
+    for variant in variants:
         variant_dir = args.output_root / variant["name"]
         quantization_dir = variant_dir / "quantization"
         inspection_dir = variant_dir / "qdq"
@@ -274,23 +303,24 @@ def main() -> None:
         _write_json(result_path, result)
         _write_markdown(markdown_path, result)
 
-        inspect_command = [
-            sys.executable,
-            str(inspect_script),
-            "--quantization-manifest",
-            str(quantization_dir / "quantization_manifest.json"),
-            "--graph",
-            args.graph,
-            "--output-dir",
-            str(inspection_dir),
-        ]
-        if args.keep_downloaded_models:
-            inspect_command.append("--keep-model")
-        variant_result["steps"].append(
-            _run_step("inspect_qdq", inspect_command, log_path)
-        )
-        _write_json(result_path, result)
-        _write_markdown(markdown_path, result)
+        if not args.skip_qdq_inspection:
+            inspect_command = [
+                sys.executable,
+                str(inspect_script),
+                "--quantization-manifest",
+                str(quantization_dir / "quantization_manifest.json"),
+                "--graph",
+                args.graph,
+                "--output-dir",
+                str(inspection_dir),
+            ]
+            if args.keep_downloaded_models:
+                inspect_command.append("--keep-model")
+            variant_result["steps"].append(
+                _run_step("inspect_qdq", inspect_command, log_path)
+            )
+            _write_json(result_path, result)
+            _write_markdown(markdown_path, result)
 
         probe_command = [
             sys.executable,
@@ -314,7 +344,7 @@ def main() -> None:
         _write_json(result_path, result)
         _write_markdown(markdown_path, result)
 
-        if probe_step["passed"]:
+        if probe_step["passed"] and not args.probe_only:
             validation_command = [
                 sys.executable,
                 str(verify_script),
@@ -336,11 +366,12 @@ def main() -> None:
                 validation_dir / "report.json"
             )
         else:
-            print(
-                f"Skipping chained validation for {variant['name']}: "
-                "single-graph runtime probe failed",
-                flush=True,
+            reason = (
+                "--probe-only was requested"
+                if args.probe_only
+                else "single-graph runtime probe failed"
             )
+            print(f"Skipping chained validation for {variant['name']}: {reason}")
         _write_json(result_path, result)
         _write_markdown(markdown_path, result)
 
