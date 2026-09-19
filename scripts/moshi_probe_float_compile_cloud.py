@@ -1,4 +1,4 @@
-"""Compile one uploaded, unquantized Moshi ONNX graph and probe one frame."""
+"""Compile one uploaded Moshi ONNX graph and probe a captured or overridden position."""
 
 from __future__ import annotations
 
@@ -139,14 +139,24 @@ def main() -> None:
     parser.add_argument("--graph", default="temporal_layers_30_31")
     parser.add_argument("--source-id", default="clean-000")
     parser.add_argument("--frame", type=int, default=0)
+    parser.add_argument(
+        "--probe-position",
+        type=int,
+        help="Replace only the position tensor after loading the captured sample",
+    )
     args = parser.parse_args()
     if not args.graph.startswith("temporal_layers_"):
         raise SystemExit("This control probes a Temporal shard with a position input")
+    if args.probe_position is not None and args.probe_position < 0:
+        raise SystemExit("--probe-position must be nonnegative")
 
     config, spec, sample = _source_and_sample(args)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     state_path = args.output_dir / "compile.json"
-    report_path = args.output_dir / "report.json"
+    probe_suffix = (
+        "" if args.probe_position is None else f"_position_{args.probe_position}"
+    )
+    report_path = args.output_dir / f"report{probe_suffix}.json"
     if state_path.exists():
         state = json.loads(state_path.read_text())
         if state.get("config") != config:
@@ -166,9 +176,12 @@ def main() -> None:
     position_value = np.asarray(feed["position"])
     if position_value.size != 1 or int(position_value.item()) != args.frame:
         raise ValueError("Captured position does not match the requested frame")
+    if args.probe_position is not None:
+        feed["position"] = np.array([args.probe_position], dtype=position_value.dtype)
+    probe_position = int(np.asarray(feed["position"]).item())
     print(
         f"Float control: graph={args.graph} source_model={config['source_model_id']} "
-        f"sample={args.source_id}/frame_{args.frame} "
+        f"sample={args.source_id}/frame_{args.frame} position={probe_position} "
         f"options={config['compile_options']}",
         flush=True,
     )
@@ -188,10 +201,10 @@ def main() -> None:
         samples=[feed],
         input_order=input_order,
         output_names=spec["output_names"],
-        stem=args.output_dir / "float_probe",
+        stem=args.output_dir / f"float_probe{probe_suffix}",
         retry_failed=False,
     )[0]
-    position = int(np.asarray(feed["position"]).item())
+    position = probe_position
     outputs = {}
     for index, (name, received, reference) in enumerate(
         zip(spec["output_names"], actual, expected, strict=True)
@@ -217,6 +230,7 @@ def main() -> None:
         "graph": args.graph,
         "sample": sample,
         "position": position,
+        "position_overridden": args.probe_position is not None,
         "source_model_id": config["source_model_id"],
         "compiled_model_id": compiled_model_id,
         "compile_job_id": job.job_id,
