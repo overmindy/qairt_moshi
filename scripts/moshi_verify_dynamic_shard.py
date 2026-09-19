@@ -17,10 +17,8 @@ import onnxruntime as ort
 from moshi_verify_cloud_chain import cloud_step, metrics, save_json
 
 
-def prepare(args: argparse.Namespace) -> None:
-    if any(args.output_dir.iterdir()):
-        raise ValueError("Use an empty output directory")
-    model = onnx.load(str(args.export_dir / "temporal_layers_6_7.onnx"))
+def patch_dynamic_rmsnorms(model: onnx.ModelProto) -> list[str]:
+    """Rescale the four Temporal RMSNorms without changing FP32 results."""
     constants = {value.name: numpy_helper.to_array(value) for value in model.graph.initializer}
     for node in model.graph.node:
         if node.op_type == "Constant":
@@ -96,6 +94,14 @@ def prepare(args: argparse.Namespace) -> None:
     model.graph.node.extend(nodes)
     model.graph.initializer.append(numpy_helper.from_array(np.array(1, np.float32), "dynamic_one"))
     onnx.checker.check_model(model)
+    return changes
+
+
+def prepare(args: argparse.Namespace) -> None:
+    if any(args.output_dir.iterdir()):
+        raise ValueError("Use an empty output directory")
+    model = onnx.load(str(args.export_dir / "temporal_layers_6_7.onnx"))
+    changes = patch_dynamic_rmsnorms(model)
     onnx.save(model, str(args.output_dir / "temporal_layers_6_7.onnx"))
     manifest = json.loads((args.export_dir / "manifest.json").read_text())
     shard = next(item for item in manifest["shards"] if item["start_layer"] == 6)
