@@ -4,6 +4,8 @@
 requires FP32 ONNX parity on captured and failing-chain inputs. ``cloud``
 reuses that receipt, quantizes with the *existing* codebook-0 settings, compiles
 one DLC, and probes the two saved head outputs. Other graphs are untouched.
+``float-control`` compiles that same uploaded ONNX without quantization to
+separate PTQ effects from compilation/runtime effects.
 """
 
 from __future__ import annotations
@@ -40,6 +42,7 @@ from qai_hub_models.models.templates.moshi.model import load_moshi_lm
 
 
 FORMAT = "moshi-depformer0-single-value-v1"
+FLOAT_FORMAT = "moshi-depformer0-single-value-float-control-v1"
 GRAPH = "depformer_codebook_0"
 MAX_RELATIVE_RMS = 0.05
 MAX_PRESERVED_ABS = 0.001
@@ -429,9 +432,118 @@ def _cloud(args: argparse.Namespace) -> None:
     print(f"Single-graph gate PASS; candidate manifest={candidate_path}", flush=True)
 
 
+def _float_control(args: argparse.Namespace) -> None:
+    """Compile the same patched ONNX without PTQ to isolate quantization effects."""
+    plan, spec, _, patched_path = _verified_plan(args)
+    quantized_state_path = args.output_dir / "jobs.json"
+    quantized_state = (
+        json.loads(quantized_state_path.read_text())
+        if quantized_state_path.exists()
+        else {}
+    )
+    if quantized_state.get("plan") != plan or not quantized_state.get("source_model_id"):
+        raise ValueError(
+            "Run cloud once first; float control reuses its verified patched ONNX upload"
+        )
+    state_path = args.output_dir / "float_jobs.json"
+    state = (
+        json.loads(state_path.read_text())
+        if state_path.exists()
+        else {"plan": plan, "source_model_id": quantized_state["source_model_id"]}
+    )
+    if (
+        state.get("plan") != plan
+        or state.get("source_model_id") != quantized_state["source_model_id"]
+    ):
+        raise ValueError("Float control plan changed; use a new output directory")
+    _write_json(state_path, state)
+
+    calibration = json.loads((args.calibration_dir / "manifest.json").read_text())
+    graph_calibration = calibration["graphs"][GRAPH]
+    job_id = state.get("compile_job_id")
+    if job_id:
+        job = hub.get_job(job_id)
+        if job.get_status().failure:
+            if not args.retry_failed:
+                raise RuntimeError(
+                    f"Recorded float compile failed: {job.url}; pass --retry-failed"
+                )
+            state.setdefault("failed_job_ids", []).append(job_id)
+            state.pop("compile_job_id", None)
+            state.pop("compiled_model_id", None)
+            _write_json(state_path, state)
+            job_id = None
+    if not job_id:
+        job = hub.submit_compile_job(
+            model=hub.get_model(state["source_model_id"]),
+            input_specs=_input_specs(args.calibration_dir, graph_calibration),
+            device=hub.Device(**plan["target_device"]),
+            name="moshi-depformer-codebook-0-single-value-float-control",
+            options=plan["compile_options"],
+        )
+        state["compile_job_id"] = job.job_id
+        _write_json(state_path, state)
+        print(f"Unquantized compile submitted: {job.url}", flush=True)
+    else:
+        print(f"Unquantized compile resumed: {job.url}", flush=True)
+    compiled_id = _target(job, "Unquantized compile")
+    if state.get("compiled_model_id", compiled_id) != compiled_id:
+        raise ValueError("Recorded unquantized compiled model ID changed")
+    state["compiled_model_id"] = compiled_id
+    _write_json(state_path, state)
+
+    feeds = _chain_feeds(args, spec)
+    session = _session(patched_path)
+    expected = [session.run(spec["output_names"], feed) for feed in feeds]
+    input_order = list(job.get_target_shapes())
+    if set(input_order) != set(spec["input_names"]):
+        raise ValueError(f"Unquantized compiled input names changed: {input_order}")
+    actual = _cloud_batch(
+        model_id=compiled_id,
+        device=plan["target_device"],
+        samples=feeds,
+        input_order=input_order,
+        output_names=spec["output_names"],
+        stem=args.output_dir / "float_two_frame_probe",
+        retry_failed=args.retry_failed,
+    )
+    report: dict[str, Any] = {
+        "format": FLOAT_FORMAT,
+        "graph": GRAPH,
+        "source_model_id": state["source_model_id"],
+        "compile_job_id": state["compile_job_id"],
+        "compiled_model_id": compiled_id,
+        "samples": [],
+    }
+    for frame, (received, reference) in enumerate(zip(actual, expected, strict=True)):
+        outputs = {
+            "audio_token_match": bool(np.array_equal(received[0], reference[0])),
+            "audio_logits": _probe_metrics(received[1], reference[1]),
+            "cache": {},
+        }
+        for name, cloud_value, cpu_value in zip(
+            spec["output_names"][2:], received[2:], reference[2:], strict=True
+        ):
+            if cloud_value.shape != cpu_value.shape or cloud_value.ndim != 4:
+                raise ValueError(f"Unexpected float-control cache shape for {name}")
+            outputs["cache"][name] = _probe_metrics(
+                cloud_value[:, :, 0], cpu_value[:, :, 0]
+            )
+        report["samples"].append({"frame": frame, **outputs})
+        print(
+            f"float frame={frame} layer0_key="
+            f"{outputs['cache']['output_layer_0_key']} "
+            f"logits={outputs['audio_logits']}",
+            flush=True,
+        )
+    report_path = args.output_dir / "float_report.json"
+    _write_json(report_path, report)
+    print(f"Float-control report: {report_path}", flush=True)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", choices=("prepare", "cloud"))
+    parser.add_argument("mode", choices=("prepare", "cloud", "float-control"))
     parser.add_argument("--onnx-dir", type=Path, required=True)
     parser.add_argument("--calibration-dir", type=Path, required=True)
     parser.add_argument("--source-quantization-manifest", type=Path, required=True)
@@ -449,8 +561,10 @@ def main() -> None:
         if args.model_dir is None:
             parser.error("prepare requires --model-dir")
         _prepare(args)
-    else:
+    elif args.mode == "cloud":
         _cloud(args)
+    else:
+        _float_control(args)
 
 
 if __name__ == "__main__":
