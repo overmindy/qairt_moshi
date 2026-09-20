@@ -7,6 +7,8 @@ import gc
 import hashlib
 import json
 import math
+import os
+import shutil
 from pathlib import Path
 from typing import Any
 
@@ -132,6 +134,7 @@ def _cloud_batch(
     output_names: list[str],
     stem: Path,
     retry_failed: bool,
+    reuse_stem: Path | None = None,
 ) -> list[list[np.ndarray]]:
     if not samples:
         raise ValueError("Cloud inference batch cannot be empty")
@@ -144,6 +147,40 @@ def _cloud_batch(
     signature = _batch_signature(model_id, device, output_names, converted)
     record_path = stem.with_suffix(".json")
     archive_path = stem.with_suffix(".npz")
+    if reuse_stem is not None and not record_path.exists() and not archive_path.exists():
+        old_record_path = reuse_stem.with_suffix(".json")
+        old_archive_path = reuse_stem.with_suffix(".npz")
+        if old_record_path.is_file() and old_archive_path.is_file():
+            old_record = json.loads(old_record_path.read_text())
+            if old_record.get("signature") == signature and old_record.get("job_id"):
+                old_job = hub.get_job(old_record["job_id"])
+                if not old_job.get_status().success:
+                    raise RuntimeError(
+                        f"Matching cached inference job is not successful: {old_job.url}"
+                    )
+                expected_archive_names = {
+                    f"sample_{sample}_output_{output}"
+                    for sample in range(len(converted))
+                    for output in range(len(output_names))
+                }
+                with np.load(old_archive_path) as old_archive:
+                    if set(old_archive.files) != expected_archive_names:
+                        raise ValueError(
+                            f"Cached output archive has unexpected keys: {old_archive_path}"
+                        )
+                _write_json(
+                    record_path,
+                    {**old_record, "reused_from": str(old_record_path)},
+                )
+                try:
+                    os.link(old_archive_path, archive_path)
+                except OSError:
+                    temporary_archive = archive_path.with_suffix(".reuse.tmp.npz")
+                    shutil.copy2(old_archive_path, temporary_archive)
+                    temporary_archive.replace(archive_path)
+                print(f"[reuse] {stem.name}: verified job={old_job.job_id}", flush=True)
+            else:
+                print(f"[reuse] {stem.name}: input/model signature changed", flush=True)
     record: dict[str, Any] = {}
     if record_path.exists():
         record = json.loads(record_path.read_text())
@@ -375,9 +412,20 @@ def main() -> None:
     parser.add_argument("--frames", type=int, default=4)
     parser.add_argument("--source-id", action="append")
     parser.add_argument("--retry-failed", action="store_true")
+    parser.add_argument(
+        "--reuse-stage-dir",
+        type=Path,
+        help="Reuse successful inference archives from a prior chain only when "
+        "the model, device, outputs, and every input tensor match exactly",
+    )
     args = parser.parse_args()
     if args.frames < 2:
         raise SystemExit("--frames must be at least two to exercise KV cache reuse")
+    if args.reuse_stage_dir is not None:
+        if args.reuse_stage_dir.resolve() == args.output_dir.resolve():
+            raise SystemExit("--reuse-stage-dir must differ from --output-dir")
+        if not args.reuse_stage_dir.is_dir():
+            raise SystemExit(f"Missing --reuse-stage-dir: {args.reuse_stage_dir}")
 
     graph_path = args.onnx_dir / "manifest.json"
     calibration_path = args.calibration_dir / "manifest.json"
@@ -452,11 +500,25 @@ def main() -> None:
         ],
         "target_device": device,
     }
+    if args.reuse_stage_dir is not None:
+        config["reuse_stage_dir"] = str(args.reuse_stage_dir.resolve())
     args.output_dir.mkdir(parents=True, exist_ok=True)
     config_path = args.output_dir / "run_manifest.json"
     if config_path.exists() and json.loads(config_path.read_text()) != config:
         raise SystemExit("Validation configuration changed; use a new --output-dir")
     _write_json(config_path, config)
+
+    def chain_batch(**kwargs: Any) -> list[list[np.ndarray]]:
+        stem = kwargs["stem"]
+        return _cloud_batch(
+            **kwargs,
+            reuse_stem=(
+                args.reuse_stage_dir / stem.name
+                if args.reuse_stage_dir is not None
+                else None
+            ),
+        )
+
     metrics_path = args.output_dir / "stage_metrics.json"
     stage_metrics: list[dict[str, Any]] = []
     expected_jobs = (
@@ -484,7 +546,7 @@ def main() -> None:
             )
             frontend_samples.append(feed)
             sample_keys.append((source["id"], frame))
-    cloud_outputs = _cloud_batch(
+    cloud_outputs = chain_batch(
         model_id=_target_id(quantization, frontend_name),
         device=device,
         samples=frontend_samples,
@@ -564,7 +626,7 @@ def main() -> None:
                         )
                     )
                 )
-            received_batch = _cloud_batch(
+            received_batch = chain_batch(
                 model_id=_target_id(quantization, graph_name),
                 device=device,
                 samples=samples,
@@ -621,7 +683,7 @@ def main() -> None:
             cpu_temporal[source_id][frame], cpu_text_frames[source_id][frame] = expected
             head_samples.append({"hidden": cloud_hidden[source_id][frame]})
             sample_keys.append((source_id, frame))
-    received_batch = _cloud_batch(
+    received_batch = chain_batch(
         model_id=_target_id(quantization, head_name),
         device=device,
         samples=head_samples,
@@ -734,7 +796,7 @@ def main() -> None:
                     )
                 )
                 sample_keys.append(key)
-        received_batch = _cloud_batch(
+        received_batch = chain_batch(
             model_id=_target_id(quantization, graph_name),
             device=device,
             samples=samples,
