@@ -334,8 +334,12 @@ class ExplicitDepFormer(nn.Module):
 class DepFormerStepBlock(nn.Module):
     """One real DepFormer layer specialized to one constant codebook index."""
 
-    def __init__(self, layer: nn.Module, step: int) -> None:
+    def __init__(
+        self, layer: nn.Module, step: int, *, single_value_attention: bool = False
+    ) -> None:
         super().__init__()
+        if single_value_attention and step != 0:
+            raise ValueError("Single-value attention is only valid for codebook 0")
         attention = layer.self_attn
         projection_index = _weight_index(attention, step)
         self.norm1 = layer.norm1
@@ -351,6 +355,7 @@ class DepFormerStepBlock(nn.Module):
             None if layer.gating is None else layer.gating[_weight_index(layer, step)]
         )
         self.step = step
+        self.single_value_attention = single_value_attention
         self.context = _cache_capacity(attention)
         self.heads = attention.num_heads
         self.kv_heads = attention.num_heads // attention.kv_repeat
@@ -392,9 +397,15 @@ class DepFormerStepBlock(nn.Module):
                 self.kv_repeat, dim=1
             )
         valid = (slots <= self.step).reshape(1, 1, 1, self.context)
-        update = functional.scaled_dot_product_attention(
-            query, attention_keys, attention_values, valid, dropout_p=0.0
-        )
+        if self.single_value_attention:
+            # Codebook 0 has exactly one valid attention slot. Its softmax
+            # weight is 1 regardless of query/key, so return that value while
+            # keeping the same cache writes and output projection.
+            update = attention_values[:, :, :1, :]
+        else:
+            update = functional.scaled_dot_product_attention(
+                query, attention_keys, attention_values, valid, dropout_p=0.0
+            )
         update = update.transpose(1, 2).reshape(
             hidden.shape[0], 1, query_width
         )
@@ -411,10 +422,18 @@ class DepFormerStepBlock(nn.Module):
 class ExplicitDepFormerStep(nn.Module):
     """One codebook step with explicit per-layer DepFormer K/V tensors."""
 
-    def __init__(self, depformer: ExplicitDepFormer, step: int) -> None:
+    def __init__(
+        self,
+        depformer: ExplicitDepFormer,
+        step: int,
+        *,
+        single_value_attention: bool = False,
+    ) -> None:
         super().__init__()
         if not 0 <= step < depformer.dep_q:
             raise ValueError(f"DepFormer step must be within 0:{depformer.dep_q}")
+        if single_value_attention and step != 0:
+            raise ValueError("Single-value attention is only valid for codebook 0")
         linear_index = step
         if depformer.depformer_weights_per_step_schedule is not None:
             linear_index = depformer.depformer_weights_per_step_schedule[step]
@@ -427,7 +446,10 @@ class ExplicitDepFormerStep(nn.Module):
             else depformer.audio_embeddings[step - 1]
         )
         self.blocks = nn.ModuleList(
-            DepFormerStepBlock(layer, step) for layer in depformer.layers
+            DepFormerStepBlock(
+                layer, step, single_value_attention=single_value_attention
+            )
+            for layer in depformer.layers
         )
         self.output_norm = depformer.output_norms[step]
         self.output_linear = depformer.output_linears[step]
