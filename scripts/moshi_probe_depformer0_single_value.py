@@ -5,7 +5,8 @@ requires FP32 ONNX parity on captured and failing-chain inputs. ``cloud``
 reuses that receipt, quantizes with the *existing* codebook-0 settings, compiles
 one DLC, and probes the two saved head outputs. Other graphs are untouched.
 ``float-control`` compiles that same uploaded ONNX without quantization to
-separate PTQ effects from compilation/runtime effects.
+separate PTQ effects from compilation/runtime effects. If its two-frame probe
+passes, it writes a separate unquantized candidate manifest for chained testing.
 """
 
 from __future__ import annotations
@@ -434,7 +435,7 @@ def _cloud(args: argparse.Namespace) -> None:
 
 def _float_control(args: argparse.Namespace) -> None:
     """Compile the same patched ONNX without PTQ to isolate quantization effects."""
-    plan, spec, _, patched_path = _verified_plan(args)
+    plan, spec, baseline, patched_path = _verified_plan(args)
     quantized_state_path = args.output_dir / "jobs.json"
     quantized_state = (
         json.loads(quantized_state_path.read_text())
@@ -515,30 +516,103 @@ def _float_control(args: argparse.Namespace) -> None:
         "compiled_model_id": compiled_id,
         "samples": [],
     }
-    for frame, (received, reference) in enumerate(zip(actual, expected, strict=True)):
+    passed = True
+    for frame, (feed, received, reference) in enumerate(
+        zip(feeds, actual, expected, strict=True)
+    ):
         outputs = {
             "audio_token_match": bool(np.array_equal(received[0], reference[0])),
             "audio_logits": _probe_metrics(received[1], reference[1]),
             "cache": {},
         }
+        cache_pass = True
         for name, cloud_value, cpu_value in zip(
             spec["output_names"][2:], received[2:], reference[2:], strict=True
         ):
             if cloud_value.shape != cpu_value.shape or cloud_value.ndim != 4:
                 raise ValueError(f"Unexpected float-control cache shape for {name}")
-            outputs["cache"][name] = _probe_metrics(
-                cloud_value[:, :, 0], cpu_value[:, :, 0]
+            written = _probe_metrics(cloud_value[:, :, 0], cpu_value[:, :, 0])
+            preserved = (
+                cloud_value[:, :, 1:]
+                - feed[name.removeprefix("output_")][:, :, 1:]
             )
-        report["samples"].append({"frame": frame, **outputs})
+            preserved_max = float(np.max(np.abs(preserved))) if preserved.size else 0.0
+            outputs["cache"][name] = {
+                **written,
+                "preserved_max_abs": preserved_max,
+            }
+            cache_pass &= bool(
+                written["finite"]
+                and written["relative_rms"] <= MAX_RELATIVE_RMS
+                and np.isfinite(preserved_max)
+                and preserved_max <= MAX_PRESERVED_ABS
+            )
+        sample_pass = bool(
+            outputs["audio_token_match"]
+            and outputs["audio_logits"]["finite"]
+            and outputs["audio_logits"]["relative_rms"] <= MAX_RELATIVE_RMS
+            and cache_pass
+        )
+        passed &= sample_pass
+        report["samples"].append({"frame": frame, **outputs, "passed": sample_pass})
         print(
             f"float frame={frame} layer0_key="
             f"{outputs['cache']['output_layer_0_key']} "
             f"logits={outputs['audio_logits']}",
             flush=True,
         )
+    report["single_graph_gate_pass"] = passed
+    report["gate"] = {
+        "max_relative_rms": MAX_RELATIVE_RMS,
+        "max_preserved_abs": MAX_PRESERVED_ABS,
+    }
     report_path = args.output_dir / "float_report.json"
     _write_json(report_path, report)
     print(f"Float-control report: {report_path}", flush=True)
+    if not passed:
+        print(
+            "Float single-graph gate FAIL; no float candidate manifest created",
+            flush=True,
+        )
+        return
+
+    candidate = copy.deepcopy(baseline)
+    record = candidate["graphs"][GRAPH]
+    for key in (
+        "quantize_job_id",
+        "quantized_model_id",
+        "quantize_options",
+        "litemp_percentage",
+    ):
+        record.pop(key, None)
+    record.update(
+        {
+            "onnx_sha256": plan["patched_onnx_sha256"],
+            "reference_onnx_sha256": plan["source_onnx_sha256"],
+            "source_model_id": state["source_model_id"],
+            "compile_job_id": state["compile_job_id"],
+            "compiled_model_id": compiled_id,
+            "precision": "unquantized",
+            "status": "compile_succeeded",
+            "single_value_attention_patch": str(patched_path),
+            "single_graph_probe_report": str(report_path),
+        }
+    )
+    candidate.setdefault("graph_precisions", {})[GRAPH] = "unquantized"
+    candidate.setdefault("graph_litemp_percentages", {}).pop(GRAPH, None)
+    candidate["depformer0_float_override"] = {
+        "baseline_manifest_sha256": plan["baseline_manifest_sha256"],
+        "patched_onnx_sha256": plan["patched_onnx_sha256"],
+        "validation": "two-frame direct probe only; chained parity pending",
+    }
+    candidate_dir = args.output_dir / "float_candidate"
+    candidate_dir.mkdir(exist_ok=True)
+    candidate_path = candidate_dir / "quantization_manifest.json"
+    _write_json(candidate_path, candidate)
+    print(
+        f"Float single-graph gate PASS; candidate manifest={candidate_path}",
+        flush=True,
+    )
 
 
 def main() -> None:
