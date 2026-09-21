@@ -80,6 +80,31 @@ def _assert_equal(name: str, actual: torch.Tensor, expected: torch.Tensor) -> No
         raise RuntimeError(f"{name}: explicit state wrapper differs from upstream streaming")
 
 
+def _assert_float_close(
+    name: str, actual: torch.Tensor, expected: torch.Tensor
+) -> dict[str, float | bool]:
+    if actual.shape != expected.shape or actual.dtype != expected.dtype:
+        raise RuntimeError(
+            f"{name}: shape/dtype {tuple(actual.shape)}/{actual.dtype} != "
+            f"{tuple(expected.shape)}/{expected.dtype}"
+        )
+    delta = actual.double() - expected.double()
+    rmse = float(torch.sqrt(torch.mean(delta.square())))
+    reference_rms = float(torch.sqrt(torch.mean(expected.double().square())))
+    finite = bool(torch.isfinite(actual).all())
+    max_abs = float(delta.abs().max())
+    metrics: dict[str, float | bool] = {
+        "finite": finite,
+        "max_abs": max_abs,
+        "rmse": rmse,
+        "relative_rms": rmse / max(reference_rms, 1e-12),
+    }
+    print(f"{name}: {metrics}", flush=True)
+    if not finite or rmse > 1e-5 or max_abs > 1e-4:
+        raise RuntimeError(f"{name}: explicit state wrapper differs from upstream streaming")
+    return metrics
+
+
 def _export(
     module: torch.nn.Module,
     data: torch.Tensor,
@@ -177,11 +202,13 @@ def main() -> None:
     encoder_initial = encoder.initial_state()
     encoder_state = tuple(value.clone() for value in encoder_initial)
     explicit_codes = []
-    for frame, expected in zip(audio_frames, upstream_codes, strict=True):
+    for frame_index, (frame, expected) in enumerate(
+        zip(audio_frames, upstream_codes, strict=True)
+    ):
         result = encoder(frame, *encoder_state)
         explicit_codes.append(result[0])
         encoder_state = result[1:]
-        _assert_equal("explicit encoder", result[0], expected)
+        _assert_equal(f"explicit encoder frame={frame_index}", result[0], expected)
     encoder_path = args.output_dir / "mimi_streaming_encoder.onnx"
     _export(encoder, audio_frames[0], encoder_initial, encoder_path, "audio", "codes")
     mimi._stop_streaming()
@@ -190,11 +217,18 @@ def main() -> None:
     decoder_initial = decoder.initial_state()
     decoder_state = tuple(value.clone() for value in decoder_initial)
     explicit_audio = []
-    for codes, expected in zip(upstream_codes, upstream_audio, strict=True):
+    decoder_pytorch_metrics = []
+    for frame_index, (codes, expected) in enumerate(
+        zip(upstream_codes, upstream_audio, strict=True)
+    ):
         result = decoder(codes, *decoder_state)
         explicit_audio.append(result[0])
         decoder_state = result[1:]
-        _assert_equal("explicit decoder", result[0], expected)
+        decoder_pytorch_metrics.append(
+            _assert_float_close(
+                f"explicit decoder frame={frame_index}", result[0], expected
+            )
+        )
     decoder_path = args.output_dir / "mimi_streaming_decoder.onnx"
     _export(decoder, upstream_codes[0], decoder_initial, decoder_path, "codes", "audio")
 
@@ -265,6 +299,7 @@ def main() -> None:
         "decoder": {
             "onnx": decoder_path.name,
             "state_spec": asdict(decoder.state_spec),
+            "pytorch_metrics": decoder_pytorch_metrics,
             "metrics": decoder_metrics,
             "final_state_shapes": [list(value.shape) for value in decoder_ort_state],
         },
