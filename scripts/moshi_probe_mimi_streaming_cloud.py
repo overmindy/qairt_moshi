@@ -223,9 +223,13 @@ def main() -> None:
     parser.add_argument("--device-manifest", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--component", choices=("encoder", "decoder"), required=True)
+    parser.add_argument("--frames", type=int, default=2,
+                        help="Number of 80 ms frames to chain; first validate two")
     parser.add_argument("--diagnostic-continue", action="store_true",
                         help="Chain QNN states despite a numeric failure; overall result still fails")
     args = parser.parse_args()
+    if args.frames < 2:
+        raise ValueError("At least two frames are required to test state chaining")
     manifest = json.loads((args.onnx_dir / "manifest.json").read_text())
     if manifest.get("format") != FORMAT or manifest.get("frames_verified") != 2:
         raise ValueError("A passing two-frame explicit-state ONNX export is required")
@@ -233,8 +237,9 @@ def main() -> None:
     if device != {"name": "Samsung Galaxy S26 (Family)", "os": "16"}:
         raise ValueError(f"Unexpected device from existing manifest: {device}")
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    audio = _load_audio(args.audio_wav).numpy()
-    audio_frames = [audio[..., i * FRAME_SAMPLES:(i + 1) * FRAME_SAMPLES] for i in range(2)]
+    audio = _load_audio(args.audio_wav, args.frames).numpy()
+    audio_frames = [audio[..., i * FRAME_SAMPLES:(i + 1) * FRAME_SAMPLES]
+                    for i in range(args.frames)]
     encoder_graph = args.onnx_dir / manifest["encoder"]["onnx"]
     decoder_graph = args.onnx_dir / manifest["decoder"]["onnx"]
     initial_encoder = [np.zeros(1, np.int64),
@@ -260,17 +265,20 @@ def main() -> None:
                          args.diagnostic_continue, state_spec)
     if args.component == "decoder":
         qnn_frames = []
-        for frame in range(2):
+        for frame in range(args.frames):
             with np.load(args.output_dir / f"decoder_qnn_frame_{frame}.npz") as saved:
                 qnn_frames.append(saved["output_0"].copy())
-        _write_wav(args.output_dir / "decoder_qnn_two_frames.wav",
+        _write_wav(args.output_dir / f"decoder_qnn_{args.frames}_frames.wav",
                    np.concatenate(qnn_frames, axis=-1))
-        _write_wav(args.output_dir / "decoder_ort_two_frames.wav",
+        _write_wav(args.output_dir / f"decoder_ort_{args.frames}_frames.wav",
                    np.concatenate([item[0] for item in reference], axis=-1))
-    if any(not item["pass"] for entry in record["inference"].values()
-           for item in entry["comparison"].values()):
-        raise RuntimeError(f"Mimi streaming {args.component} two-frame float QNN parity: FAIL")
-    print(f"Mimi streaming {args.component} two-frame float QNN numeric parity: PASS", flush=True)
+    for frame in range(args.frames):
+        comparisons = record["inference"][f"frame_{frame}"]["comparison"]
+        if any(not item["pass"] for item in comparisons.values()):
+            raise RuntimeError(
+                f"Mimi streaming {args.component} {args.frames}-frame float QNN parity: FAIL"
+            )
+    print(f"Mimi streaming {args.component} {args.frames}-frame float QNN numeric parity: PASS", flush=True)
 
 
 if __name__ == "__main__":

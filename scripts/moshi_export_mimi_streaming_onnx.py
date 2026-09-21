@@ -39,7 +39,7 @@ INPUT_NAMES = ["position", "kv_cache", "conv_state"]
 STATE_OUTPUT_NAMES = ["position_out", "kv_cache_out", "conv_state_out"]
 
 
-def _load_audio(path: Path) -> torch.Tensor:
+def _load_audio(path: Path, frames: int = 2) -> torch.Tensor:
     with wave.open(str(path), "rb") as source:
         properties = (
             source.getnchannels(),
@@ -50,10 +50,10 @@ def _load_audio(path: Path) -> torch.Tensor:
         expected = (1, 2, 24_000, "NONE")
         if properties != expected:
             raise ValueError(f"Expected {expected}, got {properties}")
-        if source.getnframes() < 2 * FRAME_SAMPLES:
-            raise ValueError("Two Mimi frames are required")
+        if source.getnframes() < frames * FRAME_SAMPLES:
+            raise ValueError(f"At least {frames} Mimi frames are required")
         samples = array("h")
-        samples.frombytes(source.readframes(2 * FRAME_SAMPLES))
+        samples.frombytes(source.readframes(frames * FRAME_SAMPLES))
         if sys.byteorder != "little":
             samples.byteswap()
     return torch.tensor(samples, dtype=torch.float32).reshape(1, 1, -1) / 32768
