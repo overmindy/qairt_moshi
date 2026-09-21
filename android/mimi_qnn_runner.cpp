@@ -246,6 +246,13 @@ class Graph {
     }
   }
 
+  void resetState() {
+    for (const auto& name : {"position", "kv_cache", "conv_state"}) {
+      auto& state = input(name);
+      std::fill(state.bytes.begin(), state.bytes.end(), 0);
+    }
+  }
+
   static void copy(const Buffer& source, Buffer& target) {
     if (tensorType(source.tensor) != tensorType(target.tensor) ||
         source.bytes.size() != target.bytes.size()) {
@@ -385,21 +392,20 @@ void expect(Buffer& buffer, Qnn_DataType_t type, size_t bytes) {
 
 }  // namespace
 
-int main(int argc, char** argv) {
-  try {
-    if (argc != 7) {
-      std::cerr << "Usage: mimi_qnn_runner LIB_DIR ENCODER.dlc DECODER.dlc "
-                   "INPUT.wav OUTPUT.wav FRAMES\n";
-      return 2;
+size_t runCodecFrames(Graph& encoder, Graph& decoder, const std::string& inputWav,
+                      const std::string& outputWav, size_t requestedFrames) {
+    const auto samples = readWav(inputWav);
+    // Zero means every complete 80 ms frame in the WAV. Mimi's upstream KV
+    // cache is a ring: its 250 slots wrap while position keeps advancing.
+    if (requestedFrames == 0) {
+      requestedFrames = samples.size() / kFrameSamples;
     }
-    const size_t requestedFrames = std::stoul(argv[6]);
-    const auto samples = readWav(argv[4]);
-    if (requestedFrames == 0 || requestedFrames > samples.size() / kFrameSamples) {
+    if (requestedFrames == 0 || requestedFrames > samples.size() / kFrameSamples ||
+        requestedFrames > static_cast<size_t>(INT32_MAX / 2)) {
       throw std::runtime_error("Requested frames exceed available complete 80 ms WAV frames");
     }
-    Runtime runtime(argv[1]);
-    Graph encoder(runtime, argv[2]);
-    Graph decoder(runtime, argv[3]);
+    encoder.resetState();
+    decoder.resetState();
     auto& audioInput = encoder.input("audio");
     auto& codesOutput = encoder.output("codes");
     auto& codesInput = decoder.input("codes");
@@ -410,7 +416,7 @@ int main(int argc, char** argv) {
     expect(audioOutput, QNN_DATATYPE_FLOAT_32, kFrameSamples * sizeof(float));
     std::vector<int16_t> reconstructed;
     reconstructed.reserve(requestedFrames * kFrameSamples);
-    std::ofstream codesFile(std::string(argv[5]) + ".codes.txt");
+    std::ofstream codesFile(outputWav + ".codes.txt");
     if (!codesFile) throw std::runtime_error("Cannot create codes file");
     for (size_t frame = 0; frame < requestedFrames; ++frame) {
       std::array<float, kFrameSamples> pcm{};
@@ -451,11 +457,67 @@ int main(int argc, char** argv) {
                 << " decoder_ms=" << decoderMs << '\n';
     }
     if (!codesFile) throw std::runtime_error("Failed writing codes file");
-    writeWav(argv[5], reconstructed);
-    std::cerr << "Wrote " << reconstructed.size() << " samples to " << argv[5] << '\n';
+    writeWav(outputWav, reconstructed);
+    std::cerr << "Wrote " << reconstructed.size() << " samples to " << outputWav << '\n';
+    return requestedFrames;
+}
+
+class PreparedMimiCodec {
+ public:
+  PreparedMimiCodec(const std::string& libraryDir, const std::string& encoderDlc,
+                    const std::string& decoderDlc)
+      : runtime_(libraryDir), encoder_(runtime_, encoderDlc),
+        decoder_(runtime_, decoderDlc) {}
+
+  size_t run(const std::string& inputWav, const std::string& outputWav,
+             size_t requestedFrames) {
+    return runCodecFrames(encoder_, decoder_, inputWav, outputWav, requestedFrames);
+  }
+
+ private:
+  Runtime runtime_;
+  Graph encoder_;
+  Graph decoder_;
+};
+
+void* createMimiCodecSession(const std::string& libraryDir,
+                             const std::string& encoderDlc,
+                             const std::string& decoderDlc) {
+  return new PreparedMimiCodec(libraryDir, encoderDlc, decoderDlc);
+}
+
+size_t runMimiCodecSession(void* session, const std::string& inputWav,
+                           const std::string& outputWav, size_t requestedFrames) {
+  if (!session) throw std::runtime_error("Mimi DLCs have not been loaded");
+  return static_cast<PreparedMimiCodec*>(session)->run(inputWav, outputWav,
+                                                       requestedFrames);
+}
+
+void destroyMimiCodecSession(void* session) {
+  delete static_cast<PreparedMimiCodec*>(session);
+}
+
+size_t runMimiCodec(const std::string& libraryDir, const std::string& encoderDlc,
+                    const std::string& decoderDlc, const std::string& inputWav,
+                    const std::string& outputWav, size_t requestedFrames) {
+  PreparedMimiCodec session(libraryDir, encoderDlc, decoderDlc);
+  return session.run(inputWav, outputWav, requestedFrames);
+}
+
+#ifndef MIMI_CODEC_LIBRARY
+int main(int argc, char** argv) {
+  try {
+    if (argc != 7) {
+      std::cerr << "Usage: mimi_qnn_runner LIB_DIR ENCODER.dlc DECODER.dlc "
+                   "INPUT.wav OUTPUT.wav FRAMES (0 = all complete frames)\n";
+      return 2;
+    }
+    runMimiCodec(argv[1], argv[2], argv[3], argv[4], argv[5],
+                 std::stoul(argv[6]));
     return 0;
   } catch (const std::exception& error) {
     std::cerr << "Mimi QNN runner error: " << error.what() << '\n';
     return 1;
   }
 }
+#endif

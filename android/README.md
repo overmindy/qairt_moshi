@@ -94,3 +94,45 @@ audio capture, buffering, playback, stream reset, and end-to-end latency
 measurement around it. `scripts/moshi_compare_mimi_phone.py` compares an
 output WAV and code CSV to PyTorch streaming and ONNX references. It requires
 the real checkpoint and the explicit-state ONNX bundle on the Linux host.
+
+## Simple phone app
+
+`android/demo` wraps the **same** stateful QNN runner in a Java Activity via
+JNI. The app imports the two DLCs once through Android's document picker, then
+loads/finalizes both QNN graphs with a dedicated button. The user can record
+24 kHz mono PCM16 audio on the phone, choose a WAV, or use the bundled sample.
+Recording stops on demand and saves whole 80 ms frames; the app does not impose
+a three-second cutoff. Inference reuses the loaded graphs, resets their state
+for a new clip, and processes every complete input frame. The upstream Mimi
+KV cache is a 250-slot ring, so the fixed *shape* does not impose a 125-frame
+stream limit. The app displays all eight Encoder tokens for each frame, plays
+the input and reconstructed output separately, and can save the reconstructed
+WAV and token CSV to `Downloads/MimiDemo`. It reports model load time and
+subsequent inference time separately. The inference timer covers the native
+WAV read, graph execution, and WAV write; it excludes recording and playback.
+This is an offline clip demo, not a real-time microphone processing pipeline.
+
+The build uses Android SDK platform 34/build-tools 35, NDK, JDK, and external
+QAIRT 2.45 headers/libraries. It packages the needed Android HTP libraries and
+a small sample WAV into the APK, but **not** the two large DLCs. No vendor
+binary, model, sample audio, signing key, or APK is committed to this repo.
+`SAMPLE_WAV` is required to keep the demo sample's provenance explicit.
+
+```sh
+export ANDROID_SDK_ROOT=/path/to/android-sdk
+export ANDROID_NDK_HOME=/path/to/android-ndk
+export JAVA_HOME=/path/to/jdk
+export QNN_INCLUDE=/path/to/qairt/qnn-api/include
+export QNN_ANDROID_LIB_DIR=/path/to/qairt/third-party/android
+export SAMPLE_WAV=/path/to/short-24k-mono-pcm16.wav
+bash android/demo/build.sh
+```
+
+When the phone is connected, install the resulting
+`android/demo/build/mimi-codec-demo.apk`. Copy the Encoder and Decoder DLCs
+to the phone's `Download` directory (or another location exposed by the
+document picker), open **Mimi Codec Demo**, import each DLC, press **加载两个 DLC
+到 QNN**, then record or choose audio and press **运行 QNN Encoder → Decoder**.
+Grant microphone permission on first use. The app build and APK signature can
+be checked without a phone; QNN execution and user interaction require an
+on-device test.
