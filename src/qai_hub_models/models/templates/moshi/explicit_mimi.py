@@ -99,13 +99,17 @@ class _ExplicitMimiFrame(nn.Module):
         self._attention_entries = attention_entries
         self._transformer_offset_state = transformer_offsets[0]
         cache_shape = cache_shapes.pop()
+        if cache_shape[0] != 2:
+            raise RuntimeError(f"Unexpected {component} K/V axis: {cache_shape}")
         self.state_spec = MimiExplicitStateSpec(
             component=component,
             conv_state_shapes=tuple(entry[3] for entry in conv_entries),
             conv_state_names=tuple(entry[0] for entry in conv_entries),
             first_state_names=tuple(entry[0] for entry in first_entries),
             transformer_layers=len(attention_entries),
-            kv_cache_shape=(len(attention_entries), *cache_shape),
+            # Flatten the layer and K/V axes: QNN HTP rejects the rank-six
+            # Gather created by selecting a layer from [layers, 2, B, H, T, D].
+            kv_cache_shape=(len(attention_entries) * cache_shape[0], *cache_shape[1:]),
         )
 
     def initial_state(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -158,7 +162,7 @@ class _ExplicitMimiFrame(nn.Module):
             # to select weights. Keeping it at zero avoids a tensor-to-Python
             # conversion in the exported graph.
             state.offset_cpu = 0
-            state.kv_cache.cache = kv_cache[layer].clone()
+            state.kv_cache.cache = kv_cache[layer * 2 : layer * 2 + 2].clone()
             state.kv_cache.end_offset = position.clone()
 
     def _collect_state(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -168,8 +172,8 @@ class _ExplicitMimiFrame(nn.Module):
         # frame advances this value by two. Read the value updated by the
         # upstream attention instead of duplicating that rate conversion here.
         position_out = self._attention_entries[0][1].offset.clone()
-        caches = torch.stack(
-            [state.kv_cache.cache for _, state in self._attention_entries]
+        caches = torch.cat(
+            [state.kv_cache.cache for _, state in self._attention_entries], dim=0
         )
         convolution = torch.cat(
             [getattr(state, field).reshape(1, -1) for _, state, field, _ in self._conv_entries],

@@ -34,7 +34,7 @@ from qai_hub_models.models.templates.moshi.model import (  # noqa: E402
     resolve_moshi_checkpoint,
 )
 
-FORMAT = "moshi-mimi-explicit-streaming-onnx-v1"
+FORMAT = "moshi-mimi-explicit-streaming-onnx-v2"
 INPUT_NAMES = ["position", "kv_cache", "conv_state"]
 STATE_OUTPUT_NAMES = ["position_out", "kv_cache_out", "conv_state_out"]
 
