@@ -126,7 +126,8 @@ def _compile(component: str, graph: Path, device: dict, directory: Path):
     return target, record, record_path, names
 
 
-def _infer(component, target, record, record_path, names, frame, data, state, expected, device, directory):
+def _infer(component, target, record, record_path, names, frame, data, state, expected,
+           device, directory, diagnostic_continue):
     archive = directory / f"{component}_qnn_frame_{frame}.npz"
     entry = record.setdefault("inference", {}).setdefault(f"frame_{frame}", {})
     inputs = dict(zip(names, [data, *state], strict=True))
@@ -171,7 +172,7 @@ def _infer(component, target, record, record_path, names, frame, data, state, ex
     print(f"{component} frame={frame}: {comparisons}", flush=True)
     if component == "decoder":
         _write_wav(directory / f"decoder_qnn_frame_{frame}.wav", actual[0])
-    if not all(item["pass"] for item in comparisons.values()):
+    if not all(item["pass"] for item in comparisons.values()) and not diagnostic_continue:
         raise RuntimeError(f"{component} frame {frame} numeric parity failed")
     return actual[1:]
 
@@ -183,6 +184,8 @@ def main() -> None:
     parser.add_argument("--device-manifest", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--component", choices=("encoder", "decoder"), required=True)
+    parser.add_argument("--diagnostic-continue", action="store_true",
+                        help="Chain QNN states despite a numeric failure; overall result still fails")
     args = parser.parse_args()
     manifest = json.loads((args.onnx_dir / "manifest.json").read_text())
     if manifest.get("format") != FORMAT or manifest.get("frames_verified") != 2:
@@ -213,7 +216,11 @@ def main() -> None:
     current = initial
     for frame, (data, expected) in enumerate(zip(frames, reference, strict=True)):
         current = _infer(args.component, target, record, record_path, names,
-                         frame, data, current, expected, device, args.output_dir)
+                         frame, data, current, expected, device, args.output_dir,
+                         args.diagnostic_continue)
+    if any(not item["pass"] for entry in record["inference"].values()
+           for item in entry["comparison"].values()):
+        raise RuntimeError(f"Mimi streaming {args.component} two-frame float QNN parity: FAIL")
     print(f"Mimi streaming {args.component} two-frame float QNN numeric parity: PASS", flush=True)
 
 
