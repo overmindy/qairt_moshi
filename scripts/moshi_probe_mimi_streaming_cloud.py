@@ -58,9 +58,44 @@ def _metrics(actual: np.ndarray, expected: np.ndarray) -> dict:
         result["pass"] = bool(np.array_equal(actual, expected))
     else:
         reference_rms = float(np.sqrt(np.mean(expected.astype(np.float64) ** 2)))
+        reference_peak = float(np.max(np.abs(expected.astype(np.float64))))
         result["relative_rms"] = result["rmse"] / max(reference_rms, 1e-12)
+        result["reference_peak"] = reference_peak
+        result["normalized_max_abs"] = result["max_abs"] / max(reference_peak, 1e-12)
         result["pass"] = bool(result["rmse"] <= 0.01 and result["max_abs"] <= 0.1)
     return result
+
+
+def _state_metrics(actual: np.ndarray, expected: np.ndarray) -> dict:
+    """Use the scale of an internal feature instead of audio amplitude limits."""
+    result = _metrics(actual, expected)
+    if "relative_rms" in result:
+        result["pass"] = bool(
+            result["finite"] and result["relative_rms"] <= 0.03
+            and result["normalized_max_abs"] <= 0.1
+        )
+    return result
+
+
+def _conv_state_metrics(actual: np.ndarray, expected: np.ndarray, spec: dict) -> dict:
+    whole = _state_metrics(actual, expected)
+    if actual.shape != expected.shape:
+        return whole
+    cursor = 0
+    segments = {}
+    for name, shape in zip(
+        spec["conv_state_names"], spec["conv_state_shapes"], strict=True
+    ):
+        width = int(np.prod(shape))
+        segments[name] = _state_metrics(
+            actual[:, cursor:cursor + width], expected[:, cursor:cursor + width]
+        )
+        cursor += width
+    if cursor != actual.size:
+        raise ValueError("Convolution state spec does not cover the full tensor")
+    whole["segments"] = segments
+    whole["pass"] = bool(whole["pass"] and all(x["pass"] for x in segments.values()))
+    return whole
 
 
 def _qnn_input(value: np.ndarray) -> np.ndarray:
@@ -127,7 +162,7 @@ def _compile(component: str, graph: Path, device: dict, directory: Path):
 
 
 def _infer(component, target, record, record_path, names, frame, data, state, expected,
-           device, directory, diagnostic_continue):
+           device, directory, diagnostic_continue, state_spec):
     archive = directory / f"{component}_qnn_frame_{frame}.npz"
     entry = record.setdefault("inference", {}).setdefault(f"frame_{frame}", {})
     inputs = dict(zip(names, [data, *state], strict=True))
@@ -167,6 +202,10 @@ def _infer(component, target, record, record_path, names, frame, data, state, ex
                             **{f"output_{index}": value for index, value in enumerate(actual)})
     comparisons = {name: _metrics(value, reference) for name, value, reference in
                    zip(["data", *STATE_OUTPUT_NAMES], actual, expected, strict=True)}
+    comparisons["kv_cache_out"] = _state_metrics(actual[2], expected[2])
+    comparisons["conv_state_out"] = _conv_state_metrics(
+        actual[3], expected[3], state_spec
+    )
     entry["comparison"] = comparisons
     _save(record_path, record)
     print(f"{component} frame={frame}: {comparisons}", flush=True)
@@ -212,12 +251,22 @@ def main() -> None:
     reference = encoder_reference if args.component == "encoder" else _reference(
         _session(decoder_graph), frames, "codes", initial)
     graph = encoder_graph if args.component == "encoder" else decoder_graph
+    state_spec = manifest[args.component]["state_spec"]
     target, record, record_path, names = _compile(args.component, graph, device, args.output_dir)
     current = initial
     for frame, (data, expected) in enumerate(zip(frames, reference, strict=True)):
         current = _infer(args.component, target, record, record_path, names,
                          frame, data, current, expected, device, args.output_dir,
-                         args.diagnostic_continue)
+                         args.diagnostic_continue, state_spec)
+    if args.component == "decoder":
+        qnn_frames = []
+        for frame in range(2):
+            with np.load(args.output_dir / f"decoder_qnn_frame_{frame}.npz") as saved:
+                qnn_frames.append(saved["output_0"].copy())
+        _write_wav(args.output_dir / "decoder_qnn_two_frames.wav",
+                   np.concatenate(qnn_frames, axis=-1))
+        _write_wav(args.output_dir / "decoder_ort_two_frames.wav",
+                   np.concatenate([item[0] for item in reference], axis=-1))
     if any(not item["pass"] for entry in record["inference"].values()
            for item in entry["comparison"].values()):
         raise RuntimeError(f"Mimi streaming {args.component} two-frame float QNN parity: FAIL")
