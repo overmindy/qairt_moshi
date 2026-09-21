@@ -120,6 +120,43 @@ def _reference(session, frames: list[np.ndarray], data_name: str, state: list[np
     return results
 
 
+def _verify_upstream(
+    model_dir: Path, torch_device: str, audio_frames: list[np.ndarray],
+    encoder_reference: list[list[np.ndarray]], decoder_reference: list[list[np.ndarray]],
+    directory: Path,
+) -> None:
+    """Compare an extended ORT chain with the real checkpoint's streaming API."""
+    import torch
+
+    from qai_hub_models.models.templates.moshi.external_repos.moshi.moshi.moshi.utils.compile import (
+        no_compile,
+    )
+    from qai_hub_models.models.templates.moshi.model import resolve_moshi_checkpoint
+
+    if torch_device.startswith("cuda") and not torch.cuda.is_available():
+        raise ValueError("CUDA reference was requested but is unavailable")
+    mimi = resolve_moshi_checkpoint(model_dir=model_dir).get_mimi(device=torch_device)
+    report = []
+    waveform = []
+    with torch.no_grad(), no_compile(), mimi.streaming(1):
+        for frame, audio in enumerate(audio_frames):
+            codes = mimi.encode(torch.from_numpy(audio).to(torch_device))
+            upstream_codes = codes.to(torch.int32).cpu().numpy()
+            code_match = bool(np.array_equal(upstream_codes, encoder_reference[frame][0]))
+            upstream_audio = mimi.decode(codes)[..., :FRAME_SAMPLES].cpu().numpy()
+            waveform.append(upstream_audio)
+            metrics = _metrics(decoder_reference[frame][0], upstream_audio)
+            report.append({"frame": frame, "encoder_exact": code_match,
+                           "decoder_ort_vs_pytorch": metrics})
+            print(f"upstream frame={frame}: {report[-1]}", flush=True)
+            if not code_match or not metrics["pass"]:
+                raise RuntimeError(f"Frame {frame} ORT chain differs from upstream streaming")
+    _write_wav(directory / f"decoder_pytorch_{len(audio_frames)}_frames.wav",
+               np.concatenate(waveform, axis=-1))
+    _save(directory / f"upstream_reference_{len(audio_frames)}_frames.json",
+          {"model_dir": str(model_dir), "frames": report})
+
+
 def _compile(component: str, graph: Path, device: dict, directory: Path):
     source = onnx.load(str(graph), load_external_data=False)
     graph_inputs = {item.name: (tuple(dim.dim_value for dim in item.type.tensor_type.shape.dim),
@@ -225,6 +262,9 @@ def main() -> None:
     parser.add_argument("--component", choices=("encoder", "decoder"), required=True)
     parser.add_argument("--frames", type=int, default=2,
                         help="Number of 80 ms frames to chain; first validate two")
+    parser.add_argument("--model-dir", type=Path,
+                        help="Also verify every ORT frame against the real PyTorch Mimi stream")
+    parser.add_argument("--torch-device", default="cuda:0")
     parser.add_argument("--diagnostic-continue", action="store_true",
                         help="Chain QNN states despite a numeric failure; overall result still fails")
     args = parser.parse_args()
@@ -255,6 +295,17 @@ def main() -> None:
                           manifest["decoder"]["state_spec"]["conv_state_shapes"])), np.float32)]
     reference = encoder_reference if args.component == "encoder" else _reference(
         _session(decoder_graph), frames, "codes", initial)
+    if args.model_dir is not None:
+        decoder_reference = reference if args.component == "decoder" else _reference(
+            _session(decoder_graph), [item[0] for item in encoder_reference],
+            "codes", [
+                np.zeros(1, np.int64),
+                np.zeros(manifest["decoder"]["state_spec"]["kv_cache_shape"], np.float32),
+                np.zeros((1, sum(np.prod(shape) for shape in
+                                  manifest["decoder"]["state_spec"]["conv_state_shapes"])), np.float32),
+            ])
+        _verify_upstream(args.model_dir, args.torch_device, audio_frames,
+                         encoder_reference, decoder_reference, args.output_dir)
     graph = encoder_graph if args.component == "encoder" else decoder_graph
     state_spec = manifest[args.component]["state_spec"]
     target, record, record_path, names = _compile(args.component, graph, device, args.output_dir)
