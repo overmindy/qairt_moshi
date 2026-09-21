@@ -252,6 +252,7 @@ def main() -> None:
         "host_contract": [
             "initialize position, kv_cache, and conv_state to zero",
             "feed every state output into the same component on the next frame",
+            "treat position as an opaque Transformer timestep; one codec frame advances it by four",
             "keep encoder and decoder state independent",
             "reset all three tensors together when starting a new stream",
         ],

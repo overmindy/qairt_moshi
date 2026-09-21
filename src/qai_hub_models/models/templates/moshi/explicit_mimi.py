@@ -161,9 +161,13 @@ class _ExplicitMimiFrame(nn.Module):
             state.kv_cache.cache = kv_cache[layer].clone()
             state.kv_cache.end_offset = position.clone()
 
-    def _collect_state(
-        self, position: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def _collect_state(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        # `position` is measured in Transformer timesteps, not codec frames.
+        # Mimi's encoder Transformer runs before the 4:1 downsampler and its
+        # decoder Transformer runs after the 1:4 upsampler, so one 80 ms codec
+        # frame advances this value by four. Read the value updated by the
+        # upstream attention instead of duplicating that rate conversion here.
+        position_out = self._attention_entries[0][1].offset.clone()
         caches = torch.stack(
             [state.kv_cache.cache for _, state in self._attention_entries]
         )
@@ -171,7 +175,7 @@ class _ExplicitMimiFrame(nn.Module):
             [getattr(state, field).reshape(1, -1) for _, state, field, _ in self._conv_entries],
             dim=1,
         )
-        return position + 1, caches, convolution
+        return position_out, caches, convolution
 
 
 class ExplicitMimiEncoder(_ExplicitMimiFrame):
@@ -193,7 +197,7 @@ class ExplicitMimiEncoder(_ExplicitMimiFrame):
             (embedding,) = self.model.encoder_transformer(embedding)
         embedding = self.model._to_framerate(embedding)
         codes = self.model.quantizer.encode(embedding).to(torch.int32)
-        return codes, *self._collect_state(position)
+        return codes, *self._collect_state()
 
 
 class ExplicitMimiDecoder(_ExplicitMimiFrame):
@@ -215,4 +219,4 @@ class ExplicitMimiDecoder(_ExplicitMimiFrame):
         if self.model.decoder_transformer is not None:
             (embedding,) = self.model.decoder_transformer(embedding)
         audio = self.model.decoder(embedding)
-        return audio[..., :1920], *self._collect_state(position)
+        return audio[..., :1920], *self._collect_state()
