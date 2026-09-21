@@ -163,9 +163,9 @@ class _ExplicitMimiFrame(nn.Module):
 
     def _collect_state(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         # `position` is measured in Transformer timesteps, not codec frames.
-        # Mimi's encoder Transformer runs before the 4:1 downsampler and its
-        # decoder Transformer runs after the 1:4 upsampler, so one 80 ms codec
-        # frame advances this value by four. Read the value updated by the
+        # Mimi's encoder Transformer runs before the 2:1 downsampler and its
+        # decoder Transformer runs after the 1:2 upsampler, so one 80 ms codec
+        # frame advances this value by two. Read the value updated by the
         # upstream attention instead of duplicating that rate conversion here.
         position_out = self._attention_entries[0][1].offset.clone()
         caches = torch.stack(

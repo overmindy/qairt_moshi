@@ -249,6 +249,7 @@ def main() -> None:
     ort_audio, decoder_ort_state = _ort_chain(
         decoder_path,
         "codes",
+        "audio",
         [value.detach().cpu().numpy() for value in upstream_codes],
         decoder_initial,
     )
@@ -286,7 +287,7 @@ def main() -> None:
         "host_contract": [
             "initialize position, kv_cache, and conv_state to zero",
             "feed every state output into the same component on the next frame",
-            "treat position as an opaque Transformer timestep; one codec frame advances it by four",
+            "treat position as an opaque Transformer timestep; one codec frame advances it by two",
             "keep encoder and decoder state independent",
             "reset all three tensors together when starting a new stream",
         ],
