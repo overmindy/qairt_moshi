@@ -286,3 +286,69 @@ git push
 ```
 
 Never add `~/.cache/huggingface`, `$HF_HOME`, `.venv`, `build/`, `*.safetensors`, `*.pt`, `*.wav`, or exported QNN binaries to Git.
+
+## 7. Isolate Temporal errors before changing quantization
+
+Develop and push code on the Mac; run model, calibration, and cloud-job experiments
+from the remote Linux checkout. Do not rerun the already verified FP32 export.
+The following probe reuses `source_model_id` (the original ONNX upload, not the
+quantized model) from the current manifest. It compiles once without a quantize
+job and submits two captured inputs as one inference batch.
+
+```bash
+cd /home/user/yejialei/qairt_moshi
+git pull --ff-only personal codex/moshi-linux-experiments
+export MOSHI_ONNX=/data2/yejialei/tmp/moshi-lm-onnx-v2
+export MOSHI_CAL=/data2/yejialei/tmp/moshi-lm-calibration-mp-v1
+export MOSHI_BASE=/data2/yejialei/tmp/moshi-lm-dynamic-norm-quantized-30-31-v1
+export MOSHI_FLOAT01=/data2/yejialei/tmp/moshi-lm-float-temporal-0-1-v1
+
+/home/user/workdir-wenhao/my_conda_pkgs/qairt/bin/python -u \
+  scripts/moshi_probe_float_compile_cloud.py \
+  --onnx-dir "$MOSHI_ONNX" --calibration-dir "$MOSHI_CAL" \
+  --source-quantization-manifest "$MOSHI_BASE/quantization_manifest.json" \
+  --output-dir "$MOSHI_FLOAT01" --graph temporal_layers_0_1 \
+  --source-id clean-000 --frame 0 --frames 2 --retry-failed
+```
+
+Read `report_frames_2.json`. For each sample, inspect `output_hidden.relative_rms`,
+each cache output's `written_slot_metrics` and `preserved_max_abs`, and nonfinite
+counts. `input_hidden.fp16_square_inf_count` is a diagnostic for possible FP16
+square overflow, not proof of the backend's internal arithmetic. The second
+input uses captured FP32 caches; this is **not** a recurrent-chain test. Likewise,
+`all_outputs_finite` means no NaN/Inf, not acceptable numerical accuracy.
+
+Compile/inference IDs and output archives are resumable. `--retry-failed` replaces
+only failed jobs, not successful jobs with poor numerical results. Default
+`--frames 1` retains the existing single-sample report format. Reusing the same
+directory for `--frames 2` keeps its successful compile and uses a separate batch
+report/archive. Changing graph/source/calibration configuration needs a new
+output directory.
+
+### Self-managed quantization versus cloud quantization
+
+Current `scripts/moshi_quantize_lm_graph_set.py` calls `submit_quantize_job` and
+then compiles that job's target. A self-managed route instead calibrates on Linux
+and exports an AIMET model plus encodings, or a supported ONNX QDQ graph, then
+calls `submit_compile_job` directly. The original source upload can be reused
+for the float control, but a new locally quantized graph needs its own upload.
+No local AIMET quantization implementation is claimed by this probe.
+
+The official [AI Hub compile documentation](https://workbench.aihub.qualcomm.com/docs/hub/compile_examples.html)
+supports both quantized ONNX and `.aimet` packages. Save the policy, tensor
+bitwidth/signedness/per-channel axis, calibration sample IDs, encodings, model
+checksums, and tool versions alongside the artifact. Do not request a fresh
+`--quantize_full_type` when the intent is to compile existing quantization.
+Use `--target_runtime qnn_dlc --truncate_64bit_io` for this graph's int64 I/O.
+
+[AIMET's QDQ conversion documentation](https://qualcomm.github.io/aimet-pages/releases/latest/techniques/onnx_qdq.html)
+explains that QDQ stores integer quantization parameters, but plain FP16/BF16
+encodings are omitted by that converter. Floating-point exceptions therefore
+need explicit representation/verification; converting encodings alone does not
+guarantee the intended mixed floating/integer execution. HTP also constrains
+valid MatMul input/output type combinations, as the earlier runtime logs showed.
+
+Gate one representative graph in order: float ONNX vs float QNN, locally
+quantized ONNX vs float ONNX on identical inputs, quantized QNN vs that local
+quantized reference, then a recurrent test. A bad float compiled baseline must
+be resolved before attributing all error to quantization or sweeping all shards.
