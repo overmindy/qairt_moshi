@@ -402,3 +402,23 @@ The candidate, if all numerical gates pass, is
 `probe/candidate/quantization_manifest.json`; it changes only this shard's model.
 Do not interpret a representative two-frame test as full-LM or deployment parity.
 Apply the same checkpoints to additional affected shards before claiming that.
+
+Verified remote results (2026-10-09): uploaded guarded DLC `mq9e7ey0m`,
+captured-frame HTP job `jgodvo845`, recurrent HTP job `jg9o4kdqg`; both jobs and
+all numerical gates passed. The initial direct inference `j56o1rdv5` failed on
+input order before computation and is retained in the retry history.
+
+| Check | Previous DLC hidden relative RMS | Guarded DLC hidden relative RMS | Worst written K/V relative RMS |
+| --- | ---: | ---: | ---: |
+| Captured frame 0 | 0.96918744 | 0.00133127 | 0.02196464 |
+| Captured frame 1 | 0.98306137 | 0.00068711 | 0.01406254 |
+| Frame 1 with guarded frame-0 caches, FP32 oracle fed the same caches | Not tested | 0.00060810 | 0.01405803 |
+
+All outputs were finite. Maximum preserved-cache change was 0.00010997 in the
+captured test and 0.00003464 in the recurrent test. All eight main projection
+weights retained their original datatypes and quantization parameters (five
+INT8, three FP16). The candidate differs from the baseline only in
+`temporal_layers_0_1`, and `_compiled_input_order` successfully read and verified
+its runtime order through the completed inference receipt. Tiny extracted
+RMSNorm CPU validation also passed (max absolute error 2.98e-8). Eight focused
+regression tests passed on remote Python 3.10.
