@@ -306,6 +306,19 @@ def _compiled_input_order(quantization: dict[str, Any], graph_name: str) -> list
     record = quantization["graphs"].get(graph_name)
     if record is None:
         raise ValueError(f"Quantization manifest is missing graph {graph_name}")
+    local = record.get("local_compile")
+    if local is not None:
+        if (local.get("kind") != "qairt_rmsnorm_guard"
+                or local.get("model_id") != record.get("compiled_model_id")
+                or local.get("numerical_probe_passed") is not True
+                or not local.get("validated_inference_job_id")):
+            raise ValueError(f"Unvalidated local DLC record for {graph_name}")
+        if not hub.get_job(local["validated_inference_job_id"]).get_status().success:
+            raise ValueError(f"Local DLC inference receipt is not successful: {graph_name}")
+        input_order = record.get("compiled_input_order", [])
+        if len(input_order) != len(record["input_names"]) or set(input_order) != set(record["input_names"]):
+            raise ValueError(f"Local DLC input order changed for {graph_name}")
+        return input_order
     job_id = record.get("compile_job_id")
     if not job_id:
         raise ValueError(f"Graph {graph_name} has no compile job ID")

@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import unittest
+from unittest.mock import patch
 
 SCRIPT = Path(__file__).resolve().parents[4] / "scripts/moshi_guard_qairt_converter.py"
 spec = importlib.util.spec_from_file_location("moshi_guard", SCRIPT)
@@ -40,6 +41,27 @@ class TestRMSNormGuard(unittest.TestCase):
     def test_unknown_sdk_fails_closed(self):
         with self.assertRaisesRegex(ValueError, "binding changed"):
             module.guarded_method_source(SOURCE.replace("node_tuple[5]", "node_tuple[6]"))
+
+    def test_rebinds_already_registered_method(self):
+        namespace = {}
+        exec(SOURCE, namespace)
+
+        class Translation:
+            match_rms_norm = namespace["match_rms_norm"]
+
+            def register_method(self, name, method):
+                self.indexed_methods[name] = method
+
+        instance = Translation()
+        instance.indexed_methods = {"MATCH_RMSNORM": instance.match_rms_norm}
+        fake = SimpleNamespace(OptimizeRMSNormTranslation=Translation,
+                               MATCH_RMSNORM="MATCH_RMSNORM",
+                               OptimizationTranslations=SimpleNamespace(translations={"rms": instance}))
+        old_bound = instance.indexed_methods["MATCH_RMSNORM"]
+        with patch.object(module.inspect, "getsource", return_value=SOURCE):
+            receipt = module.install_guard(fake)
+        self.assertEqual(receipt["registry_instances"], "1")
+        self.assertIsNot(instance.indexed_methods["MATCH_RMSNORM"].__func__, old_bound.__func__)
 
 
 if __name__ == "__main__":
