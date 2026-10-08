@@ -129,7 +129,34 @@ def main() -> None:
     if not state.get("model_id"):
         state["model_id"] = hub.upload_model(str(args.dlc), name=f"moshi-{args.graph}-guarded-qdq").model_id
         _write_json(state_path, state)
-    actual = _cloud_batch(model_id=state["model_id"], device=device, samples=feeds,
+    # DLC reader tensor enumeration is NOT the cloud runtime input ABI order.
+    # Compile the already uploaded DLC (no ONNX conversion or quantization) to
+    # obtain the authoritative cloud order and a device context binary.
+    compile_path = args.output_dir / "context_compile.json"
+    compile_state = json.loads(compile_path.read_text()) if compile_path.exists() else {}
+    compile_job = hub.get_job(compile_state["job_id"]) if compile_state else None
+    if compile_job is not None and compile_job.get_status().failure:
+        if not args.retry_failed:
+            raise RuntimeError(f"Context compile failed: {compile_job.url}")
+        compile_state.setdefault("failed_job_ids", []).append(compile_job.job_id)
+        compile_job = None
+    if compile_job is None:
+        compile_job = hub.submit_compile_job(
+            model=hub.get_model(state["model_id"]), device=hub.Device(**device),
+            options="--target_runtime qnn_context_binary", name=f"moshi-{args.graph}-guarded-dlc-context")
+        compile_state["job_id"] = compile_job.job_id
+        _write_json(compile_path, compile_state)
+    compile_job.wait()
+    if not compile_job.get_status().success:
+        raise RuntimeError(f"Context compile did not succeed: {compile_job.url}")
+    target = compile_job.get_target_model()
+    if target is None:
+        raise RuntimeError("Context compile has no target model")
+    model_id = target.model_id
+    input_order = list(compile_job.get_target_shapes())
+    if len(input_order) != len(spec["input_names"]) or set(input_order) != set(spec["input_names"]):
+        raise ValueError("Cloud context interface changed")
+    actual = _cloud_batch(model_id=model_id, device=device, samples=feeds,
                           input_order=input_order, output_names=output_names,
                           stem=args.output_dir / "captured_frames_0_1", retry_failed=args.retry_failed)
     import onnxruntime as ort
@@ -139,7 +166,8 @@ def main() -> None:
     session = ort.InferenceSession(str(args.onnx_dir / spec["onnx"]), options, providers=["CPUExecutionProvider"])
     expected = [session.run(spec["output_names"], feed) for feed in feeds]
     rows = [_evaluate(a, e, f, spec, s, args) for a, e, f, s in zip(actual, expected, feeds, samples, strict=True)]
-    report = {"format": "moshi-local-guarded-dlc-probe-v1", "model_id": state["model_id"],
+    report = {"format": "moshi-local-guarded-dlc-probe-v1", "model_id": model_id,
+              "source_dlc_model_id": state["model_id"], "compile_job_id": compile_job.job_id,
               "graph": args.graph, "samples": rows, "recurrent": [], "passed": False,
               "limits": {"hidden_relative_rms": args.hidden_relative_rms_limit,
                          "written_cache_relative_rms": args.cache_relative_rms_limit,
@@ -151,7 +179,7 @@ def main() -> None:
     recurrent = {name: value.copy() for name, value in feeds[1].items()}
     for name, cache in zip(spec["input_names"][2:], actual[0][1:], strict=True):
         recurrent[name] = cache.copy()
-    recurrent_actual = _cloud_batch(model_id=state["model_id"], device=device, samples=[recurrent],
+    recurrent_actual = _cloud_batch(model_id=model_id, device=device, samples=[recurrent],
                                     input_order=input_order, output_names=output_names,
                                     stem=args.output_dir / "recurrent_frame_1", retry_failed=args.retry_failed)[0]
     recurrent_expected = session.run(spec["output_names"], recurrent)
@@ -163,9 +191,9 @@ def main() -> None:
     candidate = copy.deepcopy(baseline)
     record = candidate["graphs"][args.graph]
     old_model = record["compiled_model_id"]
-    record.update({"compiled_model_id": state["model_id"], "compile_job_id": None,
+    record.update({"compiled_model_id": model_id, "compile_job_id": compile_job.job_id,
                    "compiled_input_order": input_order,
-                   "local_compile": {"kind": "qairt_rmsnorm_guard", "model_id": state["model_id"],
+                   "local_compile": {"kind": "qairt_rmsnorm_guard", "model_id": model_id,
                                      "dlc_sha256": config["dlc_sha256"], "guard": conversion["guard"],
                                      "numerical_probe_passed": True,
                                      "validated_inference_job_id": json.loads((args.output_dir / "recurrent_frame_1.json").read_text())["job_id"],
