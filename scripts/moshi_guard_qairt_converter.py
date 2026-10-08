@@ -69,7 +69,17 @@ def install_guard(module: Any) -> dict[str, str]:
     replacement.__module__ = original.__module__
     replacement.__qualname__ = original.__qualname__
     cls.match_rms_norm = replacement
+    # The SDK decorator creates translation instances during import and caches
+    # bound methods in a registry. Updating the class alone leaves those cached
+    # methods pointing at the original code. Rebind every live RMSNorm entry.
+    instances = {id(value): value for value in module.OptimizationTranslations.translations.values()
+                 if isinstance(value, cls)}
+    if not instances:
+        raise ValueError("SDK RMSNorm translation registry changed; refusing to convert")
+    for instance in instances.values():
+        instance.register_method(module.MATCH_RMSNORM, replacement.__get__(instance, cls))
     return {"target": TARGET,
+            "registry_instances": str(len(instances)),
             "sdk_method_sha256": hashlib.sha256(source.encode()).hexdigest(),
             "guarded_method_sha256": hashlib.sha256(patched.encode()).hexdigest()}
 
