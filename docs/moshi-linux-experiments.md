@@ -352,3 +352,53 @@ Gate one representative graph in order: float ONNX vs float QNN, locally
 quantized ONNX vs float ONNX on identical inputs, quantized QNN vs that local
 quantized reference, then a recurrent test. A bad float compiled baseline must
 be resolved before attributing all error to quantization or sweeping all shards.
+
+### QAIRT 2.45 reciprocal RMSNorm conversion guard
+
+The downloaded QDQ and rewritten ONNX for `temporal_layers_0_1` agree with
+FP32 on CPU (hidden relative RMS approximately 0.0013 and 0.00088), whereas
+the previous DLC produced approximately 0.969 and 0.983 on HTP. Inspecting
+`OptimizeRMSNormTranslation.match_rms_norm` in SDK
+`lib/python/qti/aisw/converters/common/converter_ir/op_graph_optimizations.py`
+identified a specific incorrect fusion: its nested
+`match_reciprocal_no_affine_transformation` accepts `gamma * reciprocal(rms(x))`
+without checking that the multiplication's other input is `x`. It then replaces
+the reciprocal numerator with `x`; the real subsequent `Mul(x, factor)` remains,
+effectively introducing an extra multiplication by `x`.
+
+`scripts/moshi_guard_qairt_converter.py` inserts an exact input-identity check
+before this matcher mutates the graph. A rejected fusion retains primitive ops;
+it does not remove QDQ or turn all weights into float. The patch is confined to
+the converter process, and rebinds the SDK's cached translation instances as well
+as the class method. It fails closed if the expected SDK method structure changes
+and records source/patched method hashes. Installed SDK files are untouched.
+
+Use isolated NumPy 1.26.4: this SDK's conversion with the environment's NumPy
+2.2.6 also exhibited incorrect reduction axes. Do not downgrade the shared
+environment. For the remote experiment, dependencies are in
+`/data2/yejialei/tmp/moshi-qdq-0-1-cpu-check-v1/dlc_fusion_diagnostics/python-deps-numpy126`.
+
+The guarded converter is called with existing rewritten QDQ ONNX, not a fresh
+export. Preserve output order and float I/O, but set the HTP `position` ABI to
+INT32. **Do not include `position` in `--preserve_io_datatype`** when specifying
+`--source_model_input_datatype position int32`; preserving its original INT64
+conflicts with the override. Keep `--onnx_skip_simplification` so this diagnostic
+does not introduce an additional ONNX rewrite.
+
+`scripts/moshi_probe_local_dlc_cloud.py` uploads the resulting DLC once, validates
+two captured frames against FP32 ONNX, and then tests frame 1 using the actual
+cloud frame-0 caches. Default gates are hidden relative RMS <= 0.02, written-slot
+K/V relative RMS <= 0.05, preserved-cache absolute change <= 0.001, and all finite
+outputs. A candidate manifest is emitted only after all gates pass. DLC tensor
+enumeration is not runtime order: application inputs are sorted by serialized
+tensor ID. This matters because `position` has ID 2 while converted float input
+`hidden` has ID 1173. AI Hub does not accept an uploaded DLC as a new compile
+input, so this script submits inference directly against the uploaded DLC.
+
+Remote artifacts for this representative fix are under
+`/data2/yejialei/tmp/moshi-rmsnorm-guard-0-1-v1`:
+`temporal_layers_0_1_htp.dlc`, `full_htp_convert.json`, and `probe/report.json`.
+The candidate, if all numerical gates pass, is
+`probe/candidate/quantization_manifest.json`; it changes only this shard's model.
+Do not interpret a representative two-frame test as full-LM or deployment parity.
+Apply the same checkpoints to additional affected shards before claiming that.
