@@ -11,15 +11,128 @@ import concurrent.futures
 import copy
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
 import sys
 import time
+import tempfile
 import zipfile
 
 from moshi_probe_quantized_graph_cloud import _graph_specs
 from moshi_verify_lm_graph_set_cloud import _sha256, _write_json
+
+
+def download_resumable(model_id: str, archive: Path) -> None:
+    """Use the server's legacy URL response; persist bytes across read timeouts.
+
+    Current SDK S3 transfer retries 256 MiB chunks on slow links. Range requests
+    resume only contiguous saved bytes. URLs/authentication are never logged.
+    """
+    import qai_hub as hub
+    import requests
+    api = hub.client.Model.download.__globals__["api"]
+    model = hub.get_model(model_id)
+    part = archive.with_suffix(archive.suffix + ".part")
+    meta_path = archive.with_suffix(archive.suffix + ".download.json")
+    metadata = json.loads(meta_path.read_text()) if meta_path.exists() else {"model_id": model_id}
+    if metadata["model_id"] != model_id:
+        raise ValueError("Download identity changed")
+    def get_url(config):
+        response = api.create_session(client_mode=config.client_mode).get(
+            api.api_utils.api_url(config, "models", model_id, "download"),
+            headers=api.api_utils.auth_header(config),
+            params={"use_acceleration": "true", "supports_s3_credentials": "false"}, timeout=30)
+        if response.status_code != 200:
+            raise RuntimeError(f"Download metadata HTTP {response.status_code}")
+        # Opting out returns the legacy FileURL protobuf, not the new wrapper
+        # FileDownloadResponse. Its schema is the wrapper's `url` field type.
+        url = api.api_pb.FileDownloadResponse().url
+        url.ParseFromString(response.content)
+        if not url.url.startswith("https://"):
+            raise ValueError("Expected HTTPS model URL")
+        return url.url
+    failures = 0
+    while True:
+        offset = part.stat().st_size if part.exists() else 0
+        if metadata.get("size") == offset and offset:
+            break
+        try:
+            url = model._owner._api_call(get_url)
+            headers = {"Range": f"bytes={offset}-"}
+            if metadata.get("etag"):
+                headers["If-Match"] = metadata["etag"]
+            with requests.get(url, headers=headers, stream=True, timeout=(15, 45)) as response:
+                if response.status_code != 206:
+                    raise RuntimeError(f"Resumable download HTTP {response.status_code}")
+                match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", response.headers.get("Content-Range", ""))
+                if not match or int(match[1]) != offset:
+                    raise ValueError("Download range does not match saved prefix")
+                etag = response.headers.get("ETag")
+                size = int(match[3])
+                if metadata.get("etag") and etag != metadata["etag"]:
+                    raise ValueError("Remote object ETag changed")
+                if metadata.get("size") and size != metadata["size"]:
+                    raise ValueError("Remote object size changed")
+                metadata.update(size=size, etag=etag)
+                _write_json(meta_path, metadata)
+                milestone = offset // (16 * 1024**2)
+                with part.open("ab") as handle:
+                    for chunk in response.iter_content(256 * 1024):
+                        if not chunk:
+                            continue
+                        handle.write(chunk)
+                        offset += len(chunk)
+                        if offset // (16 * 1024**2) > milestone:
+                            milestone = offset // (16 * 1024**2)
+                            handle.flush()
+                            print(f"Download {model_id}: {offset}/{size} bytes", flush=True)
+            if offset != size:
+                raise RuntimeError("Download stopped before object end")
+            break
+        except ValueError:
+            raise
+        except Exception as error:
+            failures += 1
+            # Never include a presigned URL in error text/logs.
+            print(f"Download {model_id}: retry {failures}, {type(error).__name__}; saved prefix retained", flush=True)
+            if failures >= 12:
+                raise RuntimeError("Download exceeded retries; partial bytes preserved") from None
+            time.sleep(min(2**failures, 30))
+    with zipfile.ZipFile(part) as z:
+        if z.testzip() is not None:
+            raise ValueError("Downloaded ZIP CRC failed; partial artifact preserved")
+    part.replace(archive)
+
+
+def adopt_sdk_prefix(source: Path, archive: Path) -> int:
+    """Recover only a contiguous written prefix from an interrupted sparse ZIP.
+
+    Preserve the original temporary artifact. Leave one IO block of safety at
+    the allocation boundary; final ZIP CRC is still mandatory before use.
+    """
+    if not source.name.startswith(archive.name + "."):
+        raise ValueError("Interrupted download model identity differs")
+    target = archive.with_suffix(archive.suffix + ".part")
+    if target.exists():
+        raise ValueError("Refusing to replace saved prefix")
+    with source.open("rb") as original:
+        if original.read(4) != b"PK\x03\x04":
+            raise ValueError("Interrupted artifact has no ZIP header")
+        hole = os.lseek(original.fileno(), 0, os.SEEK_HOLE)
+        size = max(0, (hole // (256 * 1024) - 1) * (256 * 1024))
+        original.seek(0)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with target.open("wb") as saved:
+            remaining = size
+            while remaining:
+                chunk = original.read(min(1024 * 1024, remaining))
+                if not chunk:
+                    raise ValueError("Unexpected sparse prefix EOF")
+                saved.write(chunk)
+                remaining -= len(chunk)
+    return size
 
 
 def extract_model(archive: Path, destination: Path) -> Path:
@@ -93,6 +206,7 @@ def rebuild(name: str, args, spec: dict, baseline: dict) -> None:
             (root / "probe/candidate").mkdir(parents=True, exist_ok=True)
             _write_json(root / "probe/candidate/quantization_manifest.json", candidate)
             _write_json(root / "probe/report.json", report)
+            shutil.copy2(old / "probe/dlc_metadata.json", root / "probe/dlc_metadata.json")
             publish_file(source, args.output_root / "dlc" / f"{name}.dlc")
             stage("verified", dlc=str(source), reused_from=str(old), model_id=report["model_id"])
             return
@@ -111,7 +225,7 @@ def rebuild(name: str, args, spec: dict, baseline: dict) -> None:
             stage("downloading", source_model_id=model_id)
             archive = root / f"{model_id}.onnx.zip"
             if not archive.exists():
-                hub.get_model(model_id).download(str(archive))
+                download_resumable(model_id, archive)
             source = extract_model(archive, root / "source")
             _write_json(download, {"model_id": model_id, "onnx": str(source),
                                    "onnx_sha256": _sha256(source), "archive_sha256": _sha256(archive)})
@@ -169,6 +283,7 @@ def rebuild(name: str, args, spec: dict, baseline: dict) -> None:
 def summarize(args, baseline):
     candidate = copy.deepcopy(baseline)
     results = {}
+    inventory = {}
     lines = ["# Guarded LM DLC rebuild", "", "| Graph | Status | Detail |", "| --- | --- | --- |"]
     for name in baseline["graphs"]:
         root = args.output_root / "graphs" / name
@@ -178,14 +293,25 @@ def summarize(args, baseline):
         if record["status"] == "verified":
             c = json.loads((root / "probe/candidate/quantization_manifest.json").read_text())
             candidate["graphs"][name] = c["graphs"][name]
+            meta = json.loads((root / "probe/dlc_metadata.json").read_text())
+            report = json.loads((root / "probe/report.json").read_text())
+            inventory[name] = {"file": f"dlc/{name}.dlc",
+                               "sha256": c["graphs"][name]["local_compile"]["dlc_sha256"],
+                               "source_quantized_model_id": baseline["graphs"][name]["quantized_model_id"],
+                               "compiled_model_id": record["model_id"], "interface": meta,
+                               "captured_frames_passed": all(s["passed"] for s in report["samples"]),
+                               "recurrent_checked": bool(report["recurrent"])}
         detail = record.get("error", record.get("model_id", "")).replace("|", "/").replace("\n", " ")
         lines.append(f"| {name} | {record['status']} | {detail} |")
     all_passed = all(r["status"] == "verified" for r in results.values())
     _write_json(args.output_root / "results.json", {"all_graphs_verified": all_passed, "graphs": results})
     _write_json(args.output_root / "partial_quantization_manifest.json", candidate)
+    _write_json(args.output_root / "dlc_inventory.json", {"all_graphs_verified": all_passed, "graphs": inventory})
     (args.output_root / "RESULTS.md").write_text("\n".join(lines) + "\n")
     if all_passed:
         _write_json(args.output_root / "quantization_manifest.json", candidate)
+        (args.output_root / "SHA256SUMS").write_text("".join(
+            f"{r['sha256']}  {r['file']}\n" for r in inventory.values()))
     return all_passed
 
 
@@ -202,6 +328,12 @@ def main():
     if not 1 <= args.workers <= 3 or args.minimum_free_gib < 4:
         p.error("Use 1..3 workers and at least 4 GiB disk reserve")
     args.output_root.mkdir(parents=True, exist_ok=True)
+    # SDK downloads stage complete archives in tempfile before moving them.
+    # Keep those archives off the nearly full system partition.
+    temporary = args.output_root / "tmp"
+    temporary.mkdir(exist_ok=True)
+    os.environ["TMPDIR"] = str(temporary.resolve())
+    tempfile.tempdir = str(temporary.resolve())
     baseline = json.loads(args.baseline_manifest.read_text())
     graph = json.loads((args.onnx_dir / "manifest.json").read_text())
     specs = _graph_specs(graph)
@@ -217,7 +349,10 @@ def main():
         raise ValueError("Rebuild plan changed; use another output root")
     _write_json(plan_path, plan)
     with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as pool:
-        tasks = {pool.submit(rebuild, n, args, specs[n], baseline): n for n in baseline["graphs"]}
+        priority = ["temporal_layers_0_1", "temporal_layers_2_3", "depformer_codebook_0", "depformer_codebook_1", "frontend", "head"]
+        names = [n for n in priority if n in baseline["graphs"]]
+        names += [n for n in baseline["graphs"] if n not in names]
+        tasks = {pool.submit(rebuild, n, args, specs[n], baseline): n for n in names}
         while tasks:
             done, _ = concurrent.futures.wait(tasks, timeout=30, return_when=concurrent.futures.FIRST_COMPLETED)
             for task in done:

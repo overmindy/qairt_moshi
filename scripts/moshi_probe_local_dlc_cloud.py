@@ -196,6 +196,8 @@ def main() -> None:
                    "compiled_input_order": input_order,
                    "local_compile": {"kind": "qairt_rmsnorm_guard", "model_id": state["model_id"],
                                      "dlc_sha256": config["dlc_sha256"], "guard": conversion["guard"],
+                                     "runtime_output_names": output_names,
+                                     "logical_output_names": spec["output_names"],
                                      "numerical_probe_passed": True,
                                      "validated_inference_job_id": json.loads((args.output_dir / f"{validation_stem}.json").read_text())["job_id"],
                                      "replaces_model_id": old_model}})
