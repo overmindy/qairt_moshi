@@ -55,6 +55,15 @@ class TestNumericalGate(unittest.TestCase):
         actual[0][:] = np.nan
         self.assertFalse(self.check(actual))
 
+    def test_rounding_allowance_is_elementwise_and_still_rejects_corruption(self):
+        self.args.preserved_fp16_rounding = True
+        self.feed["layer_0_key"][:, :, 1] = 19.35965
+        actual = [v.copy() for v in self.expected]
+        actual[1][:, :, 1] = self.feed["layer_0_key"][:, :, 1].astype(np.float16)
+        self.assertTrue(self.check(actual))
+        actual[1][:, :, 2] = 0.005  # zero input has no rounding allowance
+        self.assertFalse(self.check(actual))
+
     def test_frontend_and_head_use_numeric_gate(self):
         for names in (["hidden"], ["temporal", "text_logits"]):
             spec = {"output_names": names}

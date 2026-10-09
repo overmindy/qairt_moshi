@@ -60,7 +60,19 @@ def _evaluate(actual, expected, feed, spec, sample, args) -> dict:
             entry.update({"written": written, "preserved_max_abs": preserved,
                           "written_nonzero": int(np.count_nonzero(value[:, :, slot]))})
             passed &= written["finite"] and written["relative_rms"] <= args.cache_relative_rms_limit
-            passed &= preserved <= args.preserved_absolute_limit
+            if getattr(args, "preserved_fp16_rounding", False):
+                # Per-element allowance, not a blanket relaxed absolute limit:
+                # permit only the known float32->float16 rounding error plus
+                # the original small residual tolerance.
+                excess = max((float(np.max(np.maximum(
+                    np.abs(value[:, :, start:end] - previous[:, :, start:end])
+                    - np.abs(previous[:, :, start:end].astype(np.float16).astype(np.float32)
+                             - previous[:, :, start:end]), 0)))
+                    for start, end in ((0, slot), (slot + 1, value.shape[2])) if start < end), default=0.0)
+                entry["preserved_excess_over_fp16_rounding"] = excess
+                passed &= excess <= args.preserved_absolute_limit
+            else:
+                passed &= preserved <= args.preserved_absolute_limit
         else:
             passed &= entry["relative_rms"] <= args.hidden_relative_rms_limit
         outputs[name] = entry
@@ -82,6 +94,8 @@ def main() -> None:
     parser.add_argument("--cache-relative-rms-limit", type=float, default=0.05)
     parser.add_argument("--preserved-absolute-limit", type=float, default=0.001)
     parser.add_argument("--retry-failed", action="store_true")
+    parser.add_argument("--preserved-fp16-rounding", action="store_true",
+                        help="Allow measured per-element FP16 rounding on preserved cache slots")
     parser.add_argument("--source-onnx", type=Path, help="Downloaded QDQ used for DLC conversion; verifies output names")
     args = parser.parse_args()
     for limit in (args.hidden_relative_rms_limit, args.cache_relative_rms_limit, args.preserved_absolute_limit):
@@ -175,7 +189,8 @@ def main() -> None:
               "graph": args.graph, "samples": rows, "recurrent": [], "passed": False,
               "limits": {"hidden_relative_rms": args.hidden_relative_rms_limit,
                          "written_cache_relative_rms": args.cache_relative_rms_limit,
-                         "preserved_absolute": args.preserved_absolute_limit}}
+                         "preserved_absolute": args.preserved_absolute_limit,
+                         "preserved_fp16_rounding": args.preserved_fp16_rounding}}
     _write_json(args.output_dir / "report.json", report)
     print(json.dumps(report, indent=2), flush=True)
     if not all(row["passed"] for row in rows):

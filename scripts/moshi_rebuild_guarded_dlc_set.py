@@ -186,12 +186,23 @@ def rebuild(name: str, args, spec: dict, baseline: dict) -> None:
     import qai_hub as hub
     root = args.output_root / "graphs" / name
     root.mkdir(parents=True, exist_ok=True)
+    reuse_root = getattr(args, "reuse_root", None)
+    old_root = reuse_root / "graphs" / name if reuse_root else None
+    if old_root and old_root.is_dir():
+        # Copy only receipts/results; large sources and successful conversions
+        # stay read-only at their recorded paths. New artifacts go to output_root.
+        for filename in ("source.json", "state.json"):
+            if not (root / filename).exists() and (old_root / filename).is_file():
+                shutil.copy2(old_root / filename, root / filename)
+        if not (root / "probe").exists() and (old_root / "probe").is_dir():
+            shutil.copytree(old_root / "probe", root / "probe")
     path = root / "state.json"
     state = json.loads(path.read_text()) if path.exists() else {"graph": name}
     if state.get("status") == "verified":
         candidate = root / "probe/candidate/quantization_manifest.json"
         if not candidate.is_file() or not Path(state["dlc"]).is_file():
             raise ValueError("Verified graph is missing artifacts")
+        publish_file(Path(state["dlc"]), args.output_root / "dlc" / f"{name}.dlc")
         metadata = root / "probe/dlc_metadata.json"
         if not metadata.exists() and state.get("reused_from"):
             shutil.copy2(Path(state["reused_from"]) / "probe/dlc_metadata.json", metadata)
@@ -248,7 +259,10 @@ def rebuild(name: str, args, spec: dict, baseline: dict) -> None:
         attempts = root / "attempts"
         attempts.mkdir(exist_ok=True)
         successful = []
-        for receipt in attempts.glob("*/conversion.json"):
+        receipts = list(attempts.glob("*/conversion.json"))
+        if old_root:
+            receipts += list((old_root / "attempts").glob("*/conversion.json"))
+        for receipt in receipts:
             data = json.loads(receipt.read_text())
             if data.get("status") == "success" and (receipt.parent / "model.dlc").is_file():
                 successful.append(receipt.parent)
@@ -277,12 +291,15 @@ def rebuild(name: str, args, spec: dict, baseline: dict) -> None:
             run_logged(command, attempt / "conversion.log", args.conversion_timeout)
         dlc = attempt / "model.dlc"
         stage("probing", dlc=str(dlc))
-        run_logged([sys.executable, str(Path(__file__).with_name("moshi_probe_local_dlc_cloud.py")),
+        probe_command = [sys.executable, str(Path(__file__).with_name("moshi_probe_local_dlc_cloud.py")),
                     "--dlc", str(dlc), "--conversion-receipt", str(attempt / "conversion.json"),
                     "--source-onnx", str(source), "--onnx-dir", str(args.onnx_dir),
                     "--calibration-dir", str(args.calibration_dir),
                     "--baseline-manifest", str(args.baseline_manifest), "--graph", name,
-                    "--output-dir", str(root / "probe"), "--retry-failed"], root / "probe.log")
+                    "--output-dir", str(root / "probe"), "--retry-failed"]
+        if getattr(args, "preserved_fp16_rounding", False):
+            probe_command.append("--preserved-fp16-rounding")
+        run_logged(probe_command, root / "probe.log")
         report = json.loads((root / "probe/report.json").read_text())
         if not report["passed"]:
             raise RuntimeError("Numerical validation failed")
@@ -333,6 +350,9 @@ def main():
     for name in ("onnx-dir", "calibration-dir", "baseline-manifest", "output-root", "sdk-root", "numpy-dir"):
         p.add_argument(f"--{name}", type=Path, required=True)
     p.add_argument("--reuse-verified", type=Path)
+    p.add_argument("--reuse-root", type=Path, help="Reuse old receipts, downloaded sources and conversions read-only")
+    p.add_argument("--graph", action="append", help="Process only selected graphs; full-set status stays incomplete")
+    p.add_argument("--preserved-fp16-rounding", action="store_true")
     p.add_argument("--workers", type=int, default=2)
     p.add_argument("--minimum-free-gib", type=int, default=12)
     p.add_argument("--conversion-timeout", type=int, default=1800)
@@ -365,6 +385,10 @@ def main():
         priority = ["temporal_layers_0_1", "temporal_layers_2_3", "depformer_codebook_0", "depformer_codebook_1", "frontend", "head"]
         names = [n for n in priority if n in baseline["graphs"]]
         names += [n for n in baseline["graphs"] if n not in names]
+        if args.graph:
+            if not set(args.graph).issubset(baseline["graphs"]):
+                raise ValueError("Unknown selected graph")
+            names = [n for n in names if n in args.graph]
         tasks = {pool.submit(rebuild, n, args, specs[n], baseline): n for n in names}
         while tasks:
             done, _ = concurrent.futures.wait(tasks, timeout=30, return_when=concurrent.futures.FIRST_COMPLETED)
