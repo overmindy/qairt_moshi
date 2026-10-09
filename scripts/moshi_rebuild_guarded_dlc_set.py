@@ -182,6 +182,9 @@ def rebuild(name: str, args, spec: dict, baseline: dict) -> None:
         candidate = root / "probe/candidate/quantization_manifest.json"
         if not candidate.is_file() or not Path(state["dlc"]).is_file():
             raise ValueError("Verified graph is missing artifacts")
+        metadata = root / "probe/dlc_metadata.json"
+        if not metadata.exists() and state.get("reused_from"):
+            shutil.copy2(Path(state["reused_from"]) / "probe/dlc_metadata.json", metadata)
         return
     if state.get("status") == "failed" and not args.retry_failed:
         return

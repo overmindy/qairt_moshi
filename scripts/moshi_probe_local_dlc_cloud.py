@@ -150,18 +150,26 @@ def main() -> None:
         state["config"] = config
         _write_json(state_path, state)
     _write_json(args.output_dir / "dlc_metadata.json", meta)
-    if not state.get("model_id"):
-        state["model_id"] = hub.upload_model(str(args.dlc), name=f"moshi-{args.graph}-guarded-qdq").model_id
-        _write_json(state_path, state)
-    actual = _cloud_batch(model_id=state["model_id"], device=device, samples=feeds,
-                          input_order=input_order, output_names=output_names,
-                          stem=args.output_dir / "captured_frames_0_1", retry_failed=args.retry_failed)
     import onnxruntime as ort
     options = ort.SessionOptions()
     options.intra_op_num_threads = 4
     options.inter_op_num_threads = 1
     session = ort.InferenceSession(str(args.onnx_dir / spec["onnx"]), options, providers=["CPUExecutionProvider"])
     expected = [session.run(spec["output_names"], feed) for feed in feeds]
+    if args.source_onnx:
+        qdq = ort.InferenceSession(str(args.source_onnx), options, providers=["CPUExecutionProvider"])
+        qdq_actual = [qdq.run(output_names, feed) for feed in feeds]
+        cpu_rows = [_evaluate(a, e, f, spec, s, args) for a, e, f, s in zip(qdq_actual, expected, feeds, samples, strict=True)]
+        _write_json(args.output_dir / "cpu_qdq_report.json", {"samples": cpu_rows, "passed": all(r["passed"] for r in cpu_rows)})
+        del qdq, qdq_actual
+        if not all(r["passed"] for r in cpu_rows):
+            raise RuntimeError("Existing QDQ fails CPU numerical gate; cloud upload skipped")
+    if not state.get("model_id"):
+        state["model_id"] = hub.upload_model(str(args.dlc), name=f"moshi-{args.graph}-guarded-qdq").model_id
+        _write_json(state_path, state)
+    actual = _cloud_batch(model_id=state["model_id"], device=device, samples=feeds,
+                          input_order=input_order, output_names=output_names,
+                          stem=args.output_dir / "captured_frames_0_1", retry_failed=args.retry_failed)
     rows = [_evaluate(a, e, f, spec, s, args) for a, e, f, s in zip(actual, expected, feeds, samples, strict=True)]
     report = {"format": "moshi-local-guarded-dlc-probe-v1", "model_id": state["model_id"],
               "graph": args.graph, "samples": rows, "recurrent": [], "passed": False,
