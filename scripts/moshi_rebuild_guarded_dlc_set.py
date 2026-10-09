@@ -210,6 +210,8 @@ def rebuild(name: str, args, spec: dict, baseline: dict) -> None:
     if state.get("status") == "failed" and not args.retry_failed:
         return
     def stage(status: str, **fields):
+        if status != "failed":
+            state.pop("error", None)
         state.update(status=status, updated_at=time.time(), **fields)
         _write_json(path, state)
     try:
