@@ -191,11 +191,15 @@ def rebuild(name: str, args, spec: dict, baseline: dict) -> None:
     if old_root and old_root.is_dir():
         # Copy only receipts/results; large sources and successful conversions
         # stay read-only at their recorded paths. New artifacts go to output_root.
-        for filename in ("source.json", "state.json"):
+        for filename in ("source.json",):
             if not (root / filename).exists() and (old_root / filename).is_file():
                 shutil.copy2(old_root / filename, root / filename)
         if not (root / "probe").exists() and (old_root / "probe").is_dir():
             shutil.copytree(old_root / "probe", root / "probe")
+        # Publish the state last: a verified state promises all proof files
+        # exist, even when the summary runs concurrently with this copy.
+        if not (root / "state.json").exists() and (old_root / "state.json").is_file():
+            _write_json(root / "state.json", json.loads((old_root / "state.json").read_text()))
     path = root / "state.json"
     state = json.loads(path.read_text()) if path.exists() else {"graph": name}
     if state.get("status") == "verified":
@@ -323,6 +327,13 @@ def summarize(args, baseline):
         record = json.loads(p.read_text()) if p.exists() else {"status": "pending"}
         results[name] = record
         if record["status"] == "verified":
+            record.pop("error", None)
+            required = [root / "probe/candidate/quantization_manifest.json",
+                        root / "probe/dlc_metadata.json", root / "probe/report.json"]
+            if not all(p.is_file() for p in required):
+                results[name] = {**record, "status": "pending", "error": "Verification receipts not yet complete"}
+                lines.append(f"| {name} | pending | Verification receipts not yet complete |")
+                continue
             c = json.loads((root / "probe/candidate/quantization_manifest.json").read_text())
             candidate["graphs"][name] = c["graphs"][name]
             meta = json.loads((root / "probe/dlc_metadata.json").read_text())

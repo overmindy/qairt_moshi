@@ -14,6 +14,17 @@ import moshi_rebuild_guarded_dlc_set as module
 
 
 class TestRebuild(unittest.TestCase):
+    def test_summary_during_incomplete_verified_copy_is_pending(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            graph = root / "graphs/g"
+            graph.mkdir(parents=True)
+            (graph / "state.json").write_text(json.dumps({"status": "verified"}))
+            self.assertFalse(module.summarize(SimpleNamespace(output_root=root), {"graphs": {"g": {}}}))
+            result = json.loads((root / "results.json").read_text())
+            self.assertEqual(result["graphs"]["g"]["status"], "pending")
+            self.assertFalse((root / "quantization_manifest.json").exists())
+
     def test_archive_traversal_rejected(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
