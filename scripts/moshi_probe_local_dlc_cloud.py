@@ -45,20 +45,24 @@ def _evaluate(actual, expected, feed, spec, sample, args) -> dict:
         entry = _probe_metrics(value, reference)
         if not entry["finite"]:
             passed = False
-        elif index == 0:
-            passed &= entry["relative_rms"] <= args.hidden_relative_rms_limit
-        else:
-            slot = int(np.asarray(feed["position"]).reshape(-1)[0])
+        elif name == "audio_token":
+            entry["token_match"] = bool(np.array_equal(value, reference))
+            passed &= entry["token_match"]
+        elif name.startswith("output_layer_"):
+            slot = (int(np.asarray(feed["position"]).reshape(-1)[0])
+                    if "position" in feed else int(spec["codebook"]))
             if not 0 <= slot < value.shape[2]:
                 raise ValueError("Probe only supports in-range cache positions")
             written = _probe_metrics(value[:, :, slot], reference[:, :, slot])
-            previous = feed[spec["input_names"][index + 1]]
+            previous = feed[name.removeprefix("output_")]
             preserved = max((float(np.max(np.abs(value[:, :, start:end] - previous[:, :, start:end])))
                              for start, end in ((0, slot), (slot + 1, value.shape[2])) if start < end), default=0.0)
             entry.update({"written": written, "preserved_max_abs": preserved,
                           "written_nonzero": int(np.count_nonzero(value[:, :, slot]))})
             passed &= written["finite"] and written["relative_rms"] <= args.cache_relative_rms_limit
             passed &= preserved <= args.preserved_absolute_limit
+        else:
+            passed &= entry["relative_rms"] <= args.hidden_relative_rms_limit
         outputs[name] = entry
     return {"source_id": sample["source_id"], "frame": sample["frame"], "outputs": outputs,
             "passed": bool(passed)}
@@ -78,6 +82,7 @@ def main() -> None:
     parser.add_argument("--cache-relative-rms-limit", type=float, default=0.05)
     parser.add_argument("--preserved-absolute-limit", type=float, default=0.001)
     parser.add_argument("--retry-failed", action="store_true")
+    parser.add_argument("--source-onnx", type=Path, help="Downloaded QDQ used for DLC conversion; verifies output names")
     args = parser.parse_args()
     for limit in (args.hidden_relative_rms_limit, args.cache_relative_rms_limit, args.preserved_absolute_limit):
         if not np.isfinite(limit) or limit < 0:
@@ -102,12 +107,24 @@ def main() -> None:
     spec = _graph_specs(manifest)[args.graph]
     meta = _metadata(args.dlc)
     input_order = [item["name"] for item in meta["inputs"]]
-    output_names = [f"output_{index}" for index in range(len(spec["output_names"]))]
+    if args.source_onnx:
+        import onnx
+        source_graph = onnx.load(str(args.source_onnx), load_external_data=False).graph
+        output_names = [output.name for output in source_graph.output]
+        if len(output_names) != len(spec["output_names"]):
+            raise ValueError("Source output count changed")
+        # Downloads may rename to output_N; allow only known positional names
+        # or original semantic names, never arbitrary guessed permutations.
+        if output_names not in (spec["output_names"], [f"output_{i}" for i in range(len(output_names))]):
+            raise ValueError("Unrecognized source output mapping")
+    else:
+        output_names = [f"output_{index}" for index in range(len(spec["output_names"]))]
     if set(input_order) != set(spec["input_names"]) or set(meta["outputs"]) != set(output_names):
         raise ValueError("Local DLC interface does not match the captured graph")
     # HTP input ABI is int32, whereas the original ONNX/calibration uses int64.
-    if next(item for item in meta["inputs"] if item["name"] == "position")["dtype"] != 0x0032:
-        raise ValueError("DLC position must be int32 before upload")
+    for item in meta["inputs"]:
+        if item["name"] in ("position", "sequence", "previous_token") and item["dtype"] != 0x0032:
+            raise ValueError(f"DLC integer input must be int32: {item['name']}")
     samples = [next(s for s in calibration["graphs"][args.graph]["samples"]
                     if s["source_id"] == args.source_id and s["frame"] == frame) for frame in (0, 1)]
     feeds = []
@@ -155,15 +172,20 @@ def main() -> None:
     print(json.dumps(report, indent=2), flush=True)
     if not all(row["passed"] for row in rows):
         raise RuntimeError("Captured-frame numerical gate failed; candidate not published")
-    recurrent = {name: value.copy() for name, value in feeds[1].items()}
-    for name, cache in zip(spec["input_names"][2:], actual[0][1:], strict=True):
-        recurrent[name] = cache.copy()
-    recurrent_actual = _cloud_batch(model_id=state["model_id"], device=device, samples=[recurrent],
-                                    input_order=input_order, output_names=output_names,
-                                    stem=args.output_dir / "recurrent_frame_1", retry_failed=args.retry_failed)[0]
-    recurrent_expected = session.run(spec["output_names"], recurrent)
-    report["recurrent"] = [_evaluate(recurrent_actual, recurrent_expected, recurrent, spec, samples[1], args)]
-    report["passed"] = report["recurrent"][0]["passed"]
+    validation_stem = "captured_frames_0_1"
+    if "position" in feeds[1]:
+        recurrent = {name: value.copy() for name, value in feeds[1].items()}
+        for name, cache in zip(spec["input_names"][2:], actual[0][1:], strict=True):
+            recurrent[name] = cache.copy()
+        recurrent_actual = _cloud_batch(model_id=state["model_id"], device=device, samples=[recurrent],
+                                        input_order=input_order, output_names=output_names,
+                                        stem=args.output_dir / "recurrent_frame_1", retry_failed=args.retry_failed)[0]
+        recurrent_expected = session.run(spec["output_names"], recurrent)
+        report["recurrent"] = [_evaluate(recurrent_actual, recurrent_expected, recurrent, spec, samples[1], args)]
+        report["passed"] = report["recurrent"][0]["passed"]
+        validation_stem = "recurrent_frame_1"
+    else:
+        report["passed"] = True
     _write_json(args.output_dir / "report.json", report)
     if not report["passed"]:
         raise RuntimeError("Recurrent numerical gate failed; candidate not published")
@@ -175,7 +197,7 @@ def main() -> None:
                    "local_compile": {"kind": "qairt_rmsnorm_guard", "model_id": state["model_id"],
                                      "dlc_sha256": config["dlc_sha256"], "guard": conversion["guard"],
                                      "numerical_probe_passed": True,
-                                     "validated_inference_job_id": json.loads((args.output_dir / "recurrent_frame_1.json").read_text())["job_id"],
+                                     "validated_inference_job_id": json.loads((args.output_dir / f"{validation_stem}.json").read_text())["job_id"],
                                      "replaces_model_id": old_model}})
     destination = args.output_dir / "candidate/quantization_manifest.json"
     destination.parent.mkdir(exist_ok=True)

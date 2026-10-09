@@ -55,6 +55,29 @@ class TestNumericalGate(unittest.TestCase):
         actual[0][:] = np.nan
         self.assertFalse(self.check(actual))
 
+    def test_frontend_and_head_use_numeric_gate(self):
+        for names in (["hidden"], ["temporal", "text_logits"]):
+            spec = {"output_names": names}
+            expected = [np.ones((1, 2), np.float32) for _ in names]
+            row = module._evaluate(expected, expected, {}, spec, {"source_id": "x", "frame": 0}, self.args)
+            self.assertTrue(row["passed"])
+            wrong = [np.zeros_like(v) for v in expected]
+            self.assertFalse(module._evaluate(wrong, expected, {}, spec, {"source_id": "x", "frame": 0}, self.args)["passed"])
+
+    def test_depformer_checks_codebook_slot_and_token(self):
+        spec = {"codebook": 1, "output_names": ["audio_token", "audio_logits", "output_layer_0_key"]}
+        feed = {"layer_0_key": np.zeros((1, 1, 3, 2), np.float32)}
+        expected = [np.array([7]), np.ones((1, 2), np.float32), feed["layer_0_key"].copy()]
+        expected[2][:, :, 1] = 1
+        sample = {"source_id": "x", "frame": 0}
+        self.assertTrue(module._evaluate(expected, expected, feed, spec, sample, self.args)["passed"])
+        wrong = [v.copy() for v in expected]
+        wrong[0][0] = 8
+        self.assertFalse(module._evaluate(wrong, expected, feed, spec, sample, self.args)["passed"])
+        wrong = [v.copy() for v in expected]
+        wrong[2][:, :, 1] = 0
+        self.assertFalse(module._evaluate(wrong, expected, feed, spec, sample, self.args)["passed"])
+
 
 if __name__ == "__main__":
     unittest.main()
