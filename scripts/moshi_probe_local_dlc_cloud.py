@@ -91,6 +91,8 @@ def main() -> None:
     parser.add_argument("--graph", default="temporal_layers_0_1")
     parser.add_argument("--source-id", default="clean-000")
     parser.add_argument("--hidden-relative-rms-limit", type=float, default=0.02)
+    parser.add_argument("--cpu-hidden-relative-rms-limit", type=float,
+                        help="Diagnostic-only CPU precheck limit; does not relax cloud publication gates")
     parser.add_argument("--cache-relative-rms-limit", type=float, default=0.05)
     parser.add_argument("--preserved-absolute-limit", type=float, default=0.001)
     parser.add_argument("--retry-failed", action="store_true")
@@ -98,7 +100,8 @@ def main() -> None:
                         help="Allow measured per-element FP16 rounding on preserved cache slots")
     parser.add_argument("--source-onnx", type=Path, help="Downloaded QDQ used for DLC conversion; verifies output names")
     args = parser.parse_args()
-    for limit in (args.hidden_relative_rms_limit, args.cache_relative_rms_limit, args.preserved_absolute_limit):
+    for limit in (args.hidden_relative_rms_limit, args.cache_relative_rms_limit, args.preserved_absolute_limit,
+                  args.cpu_hidden_relative_rms_limit if args.cpu_hidden_relative_rms_limit is not None else args.hidden_relative_rms_limit):
         if not np.isfinite(limit) or limit < 0:
             raise ValueError("Numerical limits must be finite and non-negative")
     conversion = json.loads(args.conversion_receipt.read_text())
@@ -170,12 +173,18 @@ def main() -> None:
     options.inter_op_num_threads = 1
     session = ort.InferenceSession(str(args.onnx_dir / spec["onnx"]), options, providers=["CPUExecutionProvider"])
     expected = [session.run(spec["output_names"], feed) for feed in feeds]
+    qdq_actual = None
     if args.source_onnx:
         qdq = ort.InferenceSession(str(args.source_onnx), options, providers=["CPUExecutionProvider"])
         qdq_actual = [qdq.run(output_names, feed) for feed in feeds]
-        cpu_rows = [_evaluate(a, e, f, spec, s, args) for a, e, f, s in zip(qdq_actual, expected, feeds, samples, strict=True)]
-        _write_json(args.output_dir / "cpu_qdq_report.json", {"samples": cpu_rows, "passed": all(r["passed"] for r in cpu_rows)})
-        del qdq, qdq_actual
+        cpu_args = copy.copy(args)
+        if args.cpu_hidden_relative_rms_limit is not None:
+            cpu_args.hidden_relative_rms_limit = args.cpu_hidden_relative_rms_limit
+        cpu_rows = [_evaluate(a, e, f, spec, s, cpu_args) for a, e, f, s in zip(qdq_actual, expected, feeds, samples, strict=True)]
+        _write_json(args.output_dir / "cpu_qdq_report.json", {"samples": cpu_rows, "passed": all(r["passed"] for r in cpu_rows),
+                    "hidden_relative_rms_limit": cpu_args.hidden_relative_rms_limit,
+                    "diagnostic_override": args.cpu_hidden_relative_rms_limit is not None})
+        del qdq
         if not all(r["passed"] for r in cpu_rows):
             raise RuntimeError("Existing QDQ fails CPU numerical gate; cloud upload skipped")
     if not state.get("model_id"):
@@ -191,6 +200,10 @@ def main() -> None:
                          "written_cache_relative_rms": args.cache_relative_rms_limit,
                          "preserved_absolute": args.preserved_absolute_limit,
                          "preserved_fp16_rounding": args.preserved_fp16_rounding}}
+    if qdq_actual is not None:
+        report["cloud_vs_qdq"] = [_evaluate(a, e, f, spec, s, args)
+                                  for a, e, f, s in zip(actual, qdq_actual, feeds, samples, strict=True)]
+        del qdq_actual
     _write_json(args.output_dir / "report.json", report)
     print(json.dumps(report, indent=2), flush=True)
     if not all(row["passed"] for row in rows):
