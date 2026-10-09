@@ -17,7 +17,7 @@ import onnxruntime as ort
 from moshi_verify_cloud_chain import cloud_step, metrics, save_json
 
 
-def patch_dynamic_rmsnorms(model: onnx.ModelProto) -> list[str]:
+def patch_dynamic_rmsnorms(model: onnx.ModelProto, reduction_names: list[str] | None = None) -> list[str]:
     """Rescale the four Temporal RMSNorms without changing FP32 results."""
     constants = {value.name: numpy_helper.to_array(value) for value in model.graph.initializer}
     for node in model.graph.node:
@@ -30,7 +30,11 @@ def patch_dynamic_rmsnorms(model: onnx.ModelProto) -> list[str]:
     reductions = [node for node in all_reductions
                   if any(re.fullmatch(r"norm[12](?:_\d+)?", part)
                          for part in node.name.split("/"))]
-    if len(reductions) != 4:
+    if reduction_names is not None:
+        reductions = [node for node in all_reductions if node.name in reduction_names]
+        if {n.name for n in reductions} != set(reduction_names):
+            raise ValueError("Selected RMSNorm reductions are missing")
+    elif len(reductions) != 4:
         raise ValueError(
             f"Expected four RMSNorms, found {len(reductions)}; "
             f"all ReduceMean nodes: {[node.name for node in all_reductions]}"
@@ -65,9 +69,15 @@ def patch_dynamic_rmsnorms(model: onnx.ModelProto) -> list[str]:
         if not any(node.name != square.name for node in consumers):
             raise ValueError("Cannot identify normalization numerator")
         first = next(node for node in members if operand in node.input)
+        opset = next(v.version for v in model.opset_import if v.domain in ("", "ai.onnx"))
+        if opset >= 18:
+            model.graph.initializer.append(numpy_helper.from_array(np.array([-1], np.int64), tag + "_axes"))
+            maximum = helper.make_node("ReduceMax", [tag + "_abs", tag + "_axes"], [tag + "_max"], keepdims=1)
+        else:
+            maximum = helper.make_node("ReduceMax", [tag + "_abs"], [tag + "_max"], axes=[-1], keepdims=1)
         inserted = [
             helper.make_node("Abs", [operand], [tag + "_abs"]),
-            helper.make_node("ReduceMax", [tag + "_abs"], [tag + "_max"], axes=[-1], keepdims=1),
+            maximum,
             helper.make_node("Max", [tag + "_max", "dynamic_one"], [tag + "_scale"]),
             helper.make_node("Div", [operand, tag + "_scale"], [tag + "_input"]),
         ]
