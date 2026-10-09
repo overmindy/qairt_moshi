@@ -102,6 +102,14 @@ def download_resumable(model_id: str, archive: Path) -> None:
             time.sleep(min(2**failures, 30))
     with zipfile.ZipFile(part) as z:
         if z.testzip() is not None:
+            if metadata.get("adopted_sdk_prefix"):
+                # A sparse filesystem allocation boundary may include unwritten
+                # padding. Never use a bad recovered prefix; keep it for audit
+                # and retry exactly once from an empty, contiguous HTTP file.
+                suffix = f".bad-prefix-{time.time_ns()}"
+                part.rename(Path(str(part) + suffix))
+                meta_path.rename(Path(str(meta_path) + suffix))
+                return download_resumable(model_id, archive)
             raise ValueError("Downloaded ZIP CRC failed; partial artifact preserved")
     part.replace(archive)
 
@@ -132,6 +140,8 @@ def adopt_sdk_prefix(source: Path, archive: Path) -> int:
                     raise ValueError("Unexpected sparse prefix EOF")
                 saved.write(chunk)
                 remaining -= len(chunk)
+    _write_json(archive.with_suffix(archive.suffix + ".download.json"),
+                {"model_id": archive.name.removesuffix(".onnx.zip"), "adopted_sdk_prefix": size})
     return size
 
 
