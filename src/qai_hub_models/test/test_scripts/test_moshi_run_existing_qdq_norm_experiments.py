@@ -37,7 +37,7 @@ class TestExperiments(unittest.TestCase):
             for name in ("onnx-dir", "calibration-dir", "reuse-root", "output-root", "publish-root", "sdk-root", "numpy-dir"):
                 argv += [f"--{name}", str(root)]
             argv += ["--baseline-manifest", str(baseline), "--graph", "a", "--graph", "b"]
-            with patch.object(sys, "argv", argv), patch.object(module, "experiment", side_effect=[RuntimeError("first failed"), None]) as run, patch.object(module, "summarize"), patch.object(module.shutil, "disk_usage", return_value=SimpleNamespace(free=100 * 1024**3)):
+            with patch.object(sys, "argv", argv), patch.object(module, "experiment", side_effect=[RuntimeError("first failed"), None]) as run, patch.object(module, "summarize"), patch.object(module.shutil, "disk_usage", return_value=SimpleNamespace(free=100 * 1024**3)), patch.object(module.tempfile, "tempdir", None), patch.dict(module.os.environ):
                 with self.assertRaises(SystemExit):
                     module.main()
             self.assertEqual(run.call_count, 2)
