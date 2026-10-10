@@ -50,6 +50,9 @@ def publish_verified(root, name, args):
         raise ValueError("Source/patch proof mismatch")
     if patch["patched_sha256"] != _sha256(root / "source/model.onnx"):
         raise ValueError("Patched model changed")
+    if patch.get("precision_refinement"):
+        if not patch.get("projection_weight_qdq_unchanged") or patch["cpu_reference_sha256"] != _sha256(args.onnx_dir / f"{name}.onnx"):
+            raise ValueError("Norm precision refinement reference/weight proof mismatch")
     candidate_path = root / "probe/candidate/quantization_manifest.json"
     candidate = json.loads(candidate_path.read_text())
     record = candidate["graphs"][name]["local_compile"]
@@ -57,6 +60,9 @@ def publish_verified(root, name, args):
         raise ValueError("Verified DLC changed")
     record["rmsnorm_patch_receipt"] = str(root / "source/patch.json")
     record["rmsnorm_patch_receipt_sha256"] = _sha256(root / "source/patch.json")
+    if patch.get("precision_refinement"):
+        record["precision_refinement"] = "float_norm_activations_only"
+        record["removed_norm_qdq_nodes"] = patch["removed_norm_qdq_nodes"]
     if (root / "cpu_review.json").exists():
         record["cpu_patch_review"] = json.loads((root / "cpu_review.json").read_text())
     _write_json(candidate_path, candidate)
@@ -85,6 +91,8 @@ def experiment(name, root, args):
                     "--graph", name, "--output-dir", str(root / "source")]
         for prefix in getattr(args, "stable_denominator", []):
             command += ["--stable-denominator", prefix]
+        if args.float_norm_activations:
+            command += ["--float-norm-activations", "--reference-onnx", str(args.onnx_dir / f"{name}.onnx")]
         try:
             run_logged(command, root / "prepare.log", 1800)
         except RuntimeError:
@@ -136,6 +144,7 @@ def main():
     p.add_argument("--cpu-patch-review-limit", type=float,
                    help="Explicit experimental admission of CPU patch differences, capped at 0.5%%; strict cloud gates remain")
     p.add_argument("--stable-denominator", action="append", default=[])
+    p.add_argument("--float-norm-activations", action="store_true")
     p.add_argument("--existing-experiment", action="append", default=[], help="graph=/absolute/existing/experiment")
     args = p.parse_args()
     existing = dict(v.split("=", 1) for v in args.existing_experiment)
