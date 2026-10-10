@@ -76,7 +76,9 @@ def publish_verified(root, name, args):
     record["rmsnorm_patch_receipt"] = str(root / "source/patch.json")
     record["rmsnorm_patch_receipt_sha256"] = _sha256(root / "source/patch.json")
     if patch.get("precision_refinement"):
-        record["precision_refinement"] = "float_norm_activations_only"
+        record["precision_refinement"] = ("float_norm_and_selected_residual_activations"
+                                          if patch.get("float_activation_tensors") else "float_norm_activations_only")
+        record["float_activation_tensors"] = patch.get("float_activation_tensors", [])
         record["removed_norm_qdq_nodes"] = patch["removed_norm_qdq_nodes"]
     if (root / "cpu_review.json").exists():
         record["cpu_patch_review"] = json.loads((root / "cpu_review.json").read_text())
@@ -108,6 +110,8 @@ def experiment(name, root, args):
             command += ["--stable-denominator", prefix]
         if args.float_norm_activations:
             command += ["--float-norm-activations", "--reference-onnx", str(args.onnx_dir / f"{name}.onnx")]
+        for tensor in getattr(args, "float_activation_tensor", []):
+            command += ["--float-activation-tensor", tensor]
         try:
             run_logged(command, root / "prepare.log", 1800)
         except RuntimeError:
@@ -160,6 +164,7 @@ def main():
                    help="Explicit experimental admission of CPU patch differences, capped at 0.5%%; strict cloud gates remain")
     p.add_argument("--stable-denominator", action="append", default=[])
     p.add_argument("--float-norm-activations", action="store_true")
+    p.add_argument("--float-activation-tensor", action="append", default=[])
     p.add_argument("--existing-experiment", action="append", default=[], help="graph=/absolute/existing/experiment")
     args = p.parse_args()
     existing = dict(v.split("=", 1) for v in args.existing_experiment)
