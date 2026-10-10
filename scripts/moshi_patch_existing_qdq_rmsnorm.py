@@ -6,12 +6,82 @@ from pathlib import Path
 
 import numpy as np
 import onnx
-from onnx import numpy_helper
+from onnx import helper, numpy_helper
 import onnxruntime as ort
 
 from moshi_verify_dynamic_shard import patch_dynamic_rmsnorms
 from moshi_probe_quantized_graph_cloud import _probe_metrics
 from moshi_verify_lm_graph_set_cloud import _sha256, _write_json
+
+
+def stabilize_denominator(model, prefix):
+    """Rescale only the square, then restore RMS units BEFORE existing QDQ.
+
+    Unlike rescaling the complete norm, this leaves reciprocal/gamma/numerator
+    and every existing quantizer input range in their original units.
+    """
+    producers = {v: n for n in model.graph.node for v in n.output}
+    reductions = [n for n in model.graph.node if n.name.startswith(prefix) and n.op_type == "ReduceMean"]
+    if len(reductions) != 1:
+        raise ValueError("Expected one denominator reduction")
+    reduction = reductions[0]
+    square = producers[reduction.input[0]]
+    if square.op_type != "Pow":
+        raise ValueError("Expected unquantized square before reduction")
+    constants = {v.name: numpy_helper.to_array(v) for v in model.graph.initializer}
+    for n in model.graph.node:
+        if n.op_type == "Constant":
+            for a in n.attribute:
+                if a.name == "value":
+                    constants[n.output[0]] = numpy_helper.to_array(a.t)
+    if square.input[1] not in constants or float(constants[square.input[1]].item()) != 2:
+        raise ValueError("Expected square exponent two")
+    additions = [n for n in model.graph.node if n.op_type == "Add" and reduction.output[0] in n.input]
+    if len(additions) != 1:
+        raise ValueError("Quantized reduction is not supported by this isolated experiment")
+    addition = additions[0]
+    epsilon = next(v for v in addition.input if v != reduction.output[0])
+    if epsilon not in constants or not 0 < float(constants[epsilon].item()) < 0.01:
+        raise ValueError("Expected positive scalar epsilon")
+    roots = [n for n in model.graph.node if n.op_type == "Sqrt" and addition.output[0] in n.input]
+    if len(roots) != 1:
+        raise ValueError("Expected unquantized square root")
+    sqrt = roots[0]
+    tag = "stable_denominator_" + str(sum(v.name.startswith("stable_denominator_") and v.name.endswith("_one") for v in model.graph.initializer))
+    model.graph.initializer.append(numpy_helper.from_array(np.array(1, np.float32), tag + "_one"))
+    opset = next(v.version for v in model.opset_import if v.domain in ("", "ai.onnx"))
+    if opset >= 18:
+        model.graph.initializer.append(numpy_helper.from_array(np.array([-1], np.int64), tag + "_axes"))
+        maximum = helper.make_node("ReduceMax", [tag + "_abs", tag + "_axes"], [tag + "_max"], keepdims=1)
+    else:
+        maximum = helper.make_node("ReduceMax", [tag + "_abs"], [tag + "_max"], axes=[-1], keepdims=1)
+    before = [helper.make_node("Abs", [square.input[0]], [tag + "_abs"]), maximum,
+              helper.make_node("Max", [tag + "_max", tag + "_one"], [tag + "_scale"]),
+              helper.make_node("Div", [square.input[0], tag + "_scale"], [tag + "_input"])]
+    square.input[0] = tag + "_input"
+    epsilon_nodes = [helper.make_node("Div", [epsilon, tag + "_scale"], [tag + "_eps1"]),
+                     helper.make_node("Div", [tag + "_eps1", tag + "_scale"], [tag + "_eps2"])]
+    for i, value in enumerate(addition.input):
+        if value == epsilon:
+            addition.input[i] = tag + "_eps2"
+    original_output = sqrt.output[0]
+    sqrt.output[0] = tag + "_rms_scaled"
+    restore = helper.make_node("Mul", [tag + "_rms_scaled", tag + "_scale"], [original_output])
+    for i, node in enumerate(before + epsilon_nodes + [restore]):
+        node.name = tag + "_op_" + str(i)
+    nodes = []
+    for node in model.graph.node:
+        if node.name == square.name:
+            nodes.extend(before)
+        if node.name == addition.name:
+            nodes.extend(epsilon_nodes)
+        nodes.append(node)
+        if node.name == sqrt.name:
+            nodes.append(restore)
+    del model.graph.node[:]
+    model.graph.node.extend(nodes)
+    onnx.checker.check_model(model)
+    return prefix
 
 
 def main():
@@ -20,6 +90,8 @@ def main():
     p.add_argument("--calibration-dir", type=Path, required=True)
     p.add_argument("--graph", required=True)
     p.add_argument("--output-dir", type=Path, required=True)
+    p.add_argument("--stable-denominator", action="append", default=[],
+                   help="Norm prefix whose RMS is restored to original units before its existing QDQ")
     args = p.parse_args()
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
         raise ValueError("Use a fresh output directory")
@@ -34,6 +106,7 @@ def main():
                           for v in model.graph.initializer}
     names = [v.name for v in model.graph.output]
     changes = patch_dynamic_rmsnorms(model, ["/norm1/ReduceMean"])
+    denominator_changes = [stabilize_denominator(model, prefix) for prefix in args.stable_denominator]
     if not all(hashlib.sha256(numpy_helper.to_array(v).tobytes()).hexdigest() == initializer_hashes[v.name]
                for v in model.graph.initializer if v.name in initializer_hashes):
         raise ValueError("Existing QDQ initializer changed")
@@ -62,6 +135,7 @@ def main():
         "graph": args.graph, "source_sha256": _sha256(args.source_onnx),
         "patched_sha256": _sha256(output), "norms": changes,
         "existing_initializer_values_unchanged": True,
+        "stable_denominators": denominator_changes,
         "samples": rows, "passed": all(r["passed"] for r in rows),
     })
     if not all(r["passed"] for r in rows):

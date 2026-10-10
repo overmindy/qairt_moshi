@@ -80,9 +80,18 @@ def experiment(name, root, args):
     source = Path(json.loads((args.reuse_root / "graphs" / name / "source.json").read_text())["onnx"])
     patch_path = root / "source/patch.json"
     if not patch_path.exists():
-        run_logged([sys.executable, "scripts/moshi_patch_existing_qdq_rmsnorm.py",
+        command = [sys.executable, "scripts/moshi_patch_existing_qdq_rmsnorm.py",
                     "--source-onnx", str(source), "--calibration-dir", str(args.calibration_dir),
-                    "--graph", name, "--output-dir", str(root / "source")], root / "prepare.log", 1800)
+                    "--graph", name, "--output-dir", str(root / "source")]
+        for prefix in getattr(args, "stable_denominator", []):
+            command += ["--stable-denominator", prefix]
+        try:
+            run_logged(command, root / "prepare.log", 1800)
+        except RuntimeError:
+            if not patch_path.is_file():
+                raise
+            # A completed but failed strict CPU check is still diagnostic data.
+            # admit_patch below decides whether an explicit review permits it.
     patch = json.loads(patch_path.read_text())
     admit_patch(root, patch, args)
     if patch["source_sha256"] != _sha256(source):
@@ -126,6 +135,7 @@ def main():
     p.add_argument("--diagnostic-graph", action="append", default=[])
     p.add_argument("--cpu-patch-review-limit", type=float,
                    help="Explicit experimental admission of CPU patch differences, capped at 0.5%%; strict cloud gates remain")
+    p.add_argument("--stable-denominator", action="append", default=[])
     p.add_argument("--existing-experiment", action="append", default=[], help="graph=/absolute/existing/experiment")
     args = p.parse_args()
     existing = dict(v.split("=", 1) for v in args.existing_experiment)
