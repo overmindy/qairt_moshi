@@ -10,10 +10,30 @@ from onnx import helper, numpy_helper
 import onnxruntime as ort
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[4] / "scripts"))
-from moshi_patch_existing_qdq_rmsnorm import stabilize_denominator
+from moshi_patch_existing_qdq_rmsnorm import stabilize_denominator, remove_norm_activation_qdq
 
 
 class TestDenominator(unittest.TestCase):
+    def test_norm_activation_removal_keeps_projection_weight_quantizers(self):
+        nodes = [
+            helper.make_node("Identity", ["x"], ["/norm2/Sqrt_output_0"], name="norm"),
+            helper.make_node("QuantizeLinear", ["/norm2/Sqrt_output_0", "s", "z"], ["nq"], name="norm_q"),
+            helper.make_node("DequantizeLinear", ["nq", "s", "z"], ["ndq"], name="norm_dq"),
+            helper.make_node("QuantizeLinear", ["onnx::MatMul_1", "s", "z"], ["wq"], name="weight_q"),
+            helper.make_node("DequantizeLinear", ["wq", "s", "z"], ["wdq"], name="weight_dq"),
+            helper.make_node("MatMul", ["ndq", "wdq"], ["out"], name="projection"),
+        ]
+        graph = helper.make_graph(nodes, "removal", [], [])
+        model = helper.make_model(graph)
+        before = {n.name: n.SerializeToString() for n in model.graph.node if n.name.startswith("weight_")}
+        removed = remove_norm_activation_qdq(model)
+        self.assertEqual(removed, ["norm_dq", "norm_q"])
+        for node in model.graph.node:
+            if node.name in before:
+                self.assertEqual(node.SerializeToString(), before[node.name])
+        projection = next(n for n in model.graph.node if n.name == "projection")
+        self.assertEqual(list(projection.input), ["/norm2/Sqrt_output_0", "wdq"])
+
     def test_restores_units_before_quantizer_and_keeps_encodings(self):
         nodes = [
             helper.make_node("Pow", ["x", "two"], ["square"], name="/norm1_1/Pow"),
