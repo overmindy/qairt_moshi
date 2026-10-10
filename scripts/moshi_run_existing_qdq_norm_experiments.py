@@ -5,10 +5,12 @@ unchanged, CPU patch parity must pass, and publication uses strict cloud gates.
 """
 import argparse
 import json
+import os
 from pathlib import Path
 import shutil
 import sys
 import time
+import tempfile
 from types import SimpleNamespace
 
 import onnx
@@ -129,6 +131,10 @@ def main():
     existing = dict(v.split("=", 1) for v in args.existing_experiment)
     baseline = json.loads(args.baseline_manifest.read_text())
     args.output_root.mkdir(parents=True, exist_ok=True)
+    temporary = args.output_root / "tmp"
+    temporary.mkdir(exist_ok=True)
+    os.environ["TMPDIR"] = str(temporary.resolve())
+    tempfile.tempdir = str(temporary.resolve())
     results = {}
     for name in args.graph:
         root = Path(existing[name]) if name in existing else args.output_root / name
