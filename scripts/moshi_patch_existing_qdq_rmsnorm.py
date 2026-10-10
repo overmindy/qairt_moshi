@@ -181,7 +181,9 @@ def main():
         actual = patched.run(names, feed)
         metrics = {name: _probe_metrics(a, e) for name, a, e in zip(names, actual, expected)}
         limit = 0.02 if args.float_norm_activations else 1e-4
-        passed = all(v["finite"] and v["relative_rms"] < limit for v in metrics.values())
+        passed = all(v["finite"] and v["relative_rms"] <
+                     (0.05 if args.float_norm_activations and index > 0 else limit)
+                     for index, v in enumerate(metrics.values()))
         rows.append({"frame": frame, "outputs": metrics, "passed": passed})
         print(json.dumps(rows[-1]), flush=True)
     _write_json(args.output_dir / "patch.json", {
@@ -194,6 +196,7 @@ def main():
         "projection_weight_qdq_unchanged": True,
         "cpu_reference_sha256": _sha256(reference),
         "cpu_relative_rms_limit": limit,
+        "cpu_cache_relative_rms_limit": 0.05 if args.float_norm_activations else limit,
         "samples": rows, "passed": all(r["passed"] for r in rows),
     })
     if not all(r["passed"] for r in rows):

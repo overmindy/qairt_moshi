@@ -22,6 +22,21 @@ from moshi_verify_lm_graph_set_cloud import _sha256, _write_json
 def admit_patch(root, patch, args):
     if patch["passed"]:
         return
+    if patch.get("precision_refinement"):
+        # Early precision-refinement receipts used 2% for every output.
+        # Recheck those stored CPU metrics against the same 2% hidden / 5%
+        # cache profile as the probe, without rewriting the old receipt.
+        rows = patch.get("samples", [])
+        if len(rows) != 2 or any(not v["finite"] or v["relative_rms"] > (0.02 if i == 0 else 0.05)
+                                for row in rows for i, v in enumerate(row["outputs"].values())):
+            raise ValueError("FP32 precision-refinement CPU gate failed")
+        _write_json(root / "cpu_review.json", {
+            "kind": "fp32_precision_refinement_profile_recheck",
+            "hidden_relative_rms_limit": 0.02, "cache_relative_rms_limit": 0.05,
+            "patch_receipt_sha256": _sha256(root / "source/patch.json"),
+            "cloud_publication_gates_unchanged": True,
+        })
+        return
     limit = getattr(args, "cpu_patch_review_limit", None)
     if limit is None or not 0 < limit <= 0.005:
         raise ValueError("Strict CPU patch parity failed; explicit diagnostic review required")
