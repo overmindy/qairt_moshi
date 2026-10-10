@@ -6,7 +6,6 @@ import sys
 
 import numpy as np
 import onnx
-from onnx import helper
 import onnxruntime as ort
 
 from moshi_probe_quantized_graph_cloud import _probe_metrics
@@ -25,6 +24,23 @@ def after_qdq(model, tensor):
     return dequantizers[0].output[0]
 
 
+def inferred_values(model):
+    """Preserve actual intermediate dtypes, including integer position arithmetic."""
+    inferred = onnx.shape_inference.infer_shapes(model, strict_mode=True, data_prop=False)
+    values = {v.name: v for v in (*inferred.graph.input, *inferred.graph.value_info,
+                                 *inferred.graph.output)}
+    return values
+
+
+def floating_value(values, name):
+    if name not in values or not values[name].type.HasField("tensor_type"):
+        raise ValueError(f"Cannot infer diagnostic output type: {name}")
+    return values[name].type.tensor_type.elem_type in (
+        onnx.TensorProto.FLOAT, onnx.TensorProto.FLOAT16, onnx.TensorProto.DOUBLE,
+        onnx.TensorProto.BFLOAT16,
+    )
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--reference-onnx", type=Path, required=True)
@@ -38,12 +54,20 @@ def main():
         raise ValueError("Completed diagnostic exists; inspect it instead of rerunning")
     reference = onnx.load(str(args.reference_onnx))
     source = onnx.load(str(args.source_onnx))
+    ref_values = inferred_values(reference)
+    source_values = inferred_values(source)
     nodes = {n.name: n for n in source.graph.node}
     pairs = []
+    skipped = []
     for node in reference.graph.node:
         selected = (node.op_type == "MatMul" or (node.op_type == "Add" and node.name.startswith("/Add"))
                     or ("norm" in node.name and node.name.endswith("/Cast_1")))
         if not selected:
+            continue
+        if len(node.output) != 1:
+            raise ValueError(f"Stage has multiple outputs: {node.name}")
+        if not floating_value(ref_values, node.output[0]):
+            skipped.append(node.name)
             continue
         peer = nodes.get(node.name)
         if peer is None or peer.op_type != node.op_type or len(peer.output) != 1 or len(node.output) != 1:
@@ -54,21 +78,25 @@ def main():
         raise ValueError("No comparable stages")
     ref_outputs = list(dict.fromkeys(v["reference"] for v in pairs))
     qdq_outputs = list(dict.fromkeys(v[k] for v in pairs for k in ("before_qdq", "after_qdq")))
-    def session(model, names):
+    def session(model, names, values):
         del model.graph.output[:]
-        model.graph.output.extend(helper.make_tensor_value_info(name, onnx.TensorProto.FLOAT, None) for name in names)
+        for name in names:
+            if not floating_value(values, name):
+                raise ValueError(f"Floating stage maps to non-floating output: {name}")
+            model.graph.output.add().CopyFrom(values[name])
         opts = ort.SessionOptions()
         opts.intra_op_num_threads = 4
         opts.inter_op_num_threads = 1
         # Fully loaded weights stay in memory; do not duplicate model files.
         return ort.InferenceSession(model.SerializeToString(), opts, providers=["CPUExecutionProvider"])
-    ref_session = session(reference, ref_outputs)
+    ref_session = session(reference, ref_outputs, ref_values)
     del reference
-    qdq_session = session(source, qdq_outputs)
+    qdq_session = session(source, qdq_outputs, source_values)
     del source
     calibration = json.loads((args.calibration_dir / "manifest.json").read_text())
     result = {"graph": args.graph, "reference_sha256": _sha256(args.reference_onnx),
-              "source_sha256": _sha256(args.source_onnx), "diagnostic_only": True, "samples": []}
+              "source_sha256": _sha256(args.source_onnx), "diagnostic_only": True,
+              "skipped_nonfloating_nodes": skipped, "samples": []}
     for frame in (0, 1):
         sample = next(s for s in calibration["graphs"][args.graph]["samples"]
                       if s["source_id"] == "clean-000" and s["frame"] == frame)
