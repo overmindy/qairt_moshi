@@ -14,6 +14,25 @@ from moshi_patch_existing_qdq_rmsnorm import stabilize_denominator, remove_norm_
 
 
 class TestDenominator(unittest.TestCase):
+    def test_explicit_output_refinement_preserves_output_abi(self):
+        graph = helper.make_graph([
+            helper.make_node("Identity", ["x"], ["residual"]),
+            helper.make_node("QuantizeLinear", ["residual", "s", "z"], ["q"], name="q"),
+            helper.make_node("DequantizeLinear", ["q", "s", "z"], ["out"], name="dq"),
+        ], "output", [helper.make_tensor_value_info("x", onnx.TensorProto.FLOAT, [1])],
+            [helper.make_tensor_value_info("out", onnx.TensorProto.FLOAT, [1])],
+            [numpy_helper.from_array(np.array(0.1, np.float32), "s"),
+             numpy_helper.from_array(np.array(0, np.uint8), "z")])
+        model = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)], ir_version=8)
+        self.assertEqual(remove_norm_activation_qdq(model, ["residual"]), ["dq", "q"])
+        onnx.checker.check_model(model)
+        actual = ort.InferenceSession(model.SerializeToString(), providers=["CPUExecutionProvider"]).run(
+            None, {"x": np.array([0.1234], np.float32)})[0]
+        np.testing.assert_array_equal(actual, np.array([0.1234], np.float32))
+        self.assertEqual(model.graph.output[0].name, "out")
+        with self.assertRaisesRegex(ValueError, "Projection weights"):
+            remove_norm_activation_qdq(model, ["onnx::MatMul_1"])
+
     def test_norm_activation_removal_keeps_projection_weight_quantizers(self):
         nodes = [
             helper.make_node("Identity", ["x"], ["/norm2/Sqrt_output_0"], name="norm"),

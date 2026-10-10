@@ -14,11 +14,16 @@ from moshi_probe_quantized_graph_cloud import _probe_metrics
 from moshi_verify_lm_graph_set_cloud import _sha256, _write_json
 
 
-def remove_norm_activation_qdq(model):
-    """Remove only QDQ pairs fed by named norm tensors; retain weight QDQ."""
+def remove_norm_activation_qdq(model, extra_tensors=()):
+    """Remove norm/explicit activation QDQ pairs; retain projection weight QDQ."""
+    if any(value.startswith("onnx::MatMul_") for value in extra_tensors):
+        raise ValueError("Projection weights cannot be requested as activation tensors")
     prefixes = ("/norm1/", "/norm2/", "/norm1_1/", "/norm2_1/")
     quantizers = [n for n in model.graph.node if n.op_type == "QuantizeLinear"
-                  and n.input[0].startswith(prefixes)]
+                  and (n.input[0].startswith(prefixes) or n.input[0] in extra_tensors)]
+    missing = set(extra_tensors) - {n.input[0] for n in quantizers}
+    if missing:
+        raise ValueError(f"Requested activation quantizer not found: {sorted(missing)}")
     rewrites, removed = {}, set()
     for quantizer in quantizers:
         consumers = [n for n in model.graph.node if quantizer.output[0] in n.input]
@@ -49,7 +54,10 @@ def remove_norm_activation_qdq(model):
     model.graph.node.extend(nodes)
     for output in model.graph.output:
         if output.name in rewrites:
-            raise ValueError("Graph output alias requires a separate explicit mapping")
+            # Keep the public ABI while removing only this output's Q/DQ pair.
+            model.graph.node.append(helper.make_node(
+                "Identity", [original(output.name)], [output.name],
+                name="float_activation_output_" + output.name))
     return sorted(removed)
 
 
@@ -132,6 +140,8 @@ def main():
     p.add_argument("--stable-denominator", action="append", default=[],
                    help="Norm prefix whose RMS is restored to original units before its existing QDQ")
     p.add_argument("--float-norm-activations", action="store_true")
+    p.add_argument("--float-activation-tensor", action="append", default=[],
+                   help="Explicit raw activation tensor whose QDQ pair is removed; weights stay quantized")
     p.add_argument("--reference-onnx", type=Path,
                    help="Original FP32 reference required for intentional norm precision refinement")
     args = p.parse_args()
@@ -150,7 +160,9 @@ def main():
     weight_qdq = {n.name: n.SerializeToString() for n in model.graph.node
                   if n.op_type in ("QuantizeLinear", "DequantizeLinear")
                   and any(value.startswith("onnx::MatMul_") for value in n.input)}
-    removed_qdq = remove_norm_activation_qdq(model) if args.float_norm_activations else []
+    if args.float_activation_tensor and not args.float_norm_activations:
+        raise ValueError("Targeted activation refinement currently requires float norm mode and FP32 reference")
+    removed_qdq = remove_norm_activation_qdq(model, args.float_activation_tensor) if args.float_norm_activations else []
     if args.float_norm_activations and not args.reference_onnx:
         raise ValueError("Norm precision refinement requires the original FP32 reference")
     changes = patch_dynamic_rmsnorms(model, None if args.float_norm_activations else ["/norm1/ReduceMean"])
@@ -193,6 +205,7 @@ def main():
         "stable_denominators": denominator_changes,
         "precision_refinement": args.float_norm_activations,
         "removed_norm_qdq_nodes": removed_qdq,
+        "float_activation_tensors": args.float_activation_tensor,
         "projection_weight_qdq_unchanged": True,
         "cpu_reference_sha256": _sha256(reference),
         "cpu_relative_rms_limit": limit,
