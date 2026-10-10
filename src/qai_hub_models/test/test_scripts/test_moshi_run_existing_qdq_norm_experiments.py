@@ -12,6 +12,22 @@ import moshi_run_existing_qdq_norm_experiments as module
 
 
 class TestExperiments(unittest.TestCase):
+    def test_cpu_review_is_explicit_bounded_and_preserves_strict_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "source").mkdir()
+            (root / "manifest.json").write_text("{}")
+            receipt = {"passed": False, "samples": [{"outputs": {"x": {"finite": True, "relative_rms": 0.003}}} for _ in range(2)]}
+            (root / "source/patch.json").write_text(json.dumps(receipt))
+            with self.assertRaises(ValueError):
+                module.admit_patch(root, receipt, SimpleNamespace())
+            module.admit_patch(root, receipt, SimpleNamespace(cpu_patch_review_limit=0.005, calibration_dir=root))
+            self.assertFalse(json.loads((root / "source/patch.json").read_text())["passed"])
+            self.assertTrue(json.loads((root / "cpu_review.json").read_text())["cloud_publication_gates_unchanged"])
+            receipt["samples"][0]["outputs"]["x"]["relative_rms"] = 0.01
+            with self.assertRaises(ValueError):
+                module.admit_patch(root, receipt, SimpleNamespace(cpu_patch_review_limit=0.005, calibration_dir=root))
+
     def test_failed_graph_does_not_stop_next_graph(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

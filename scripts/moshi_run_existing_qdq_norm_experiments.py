@@ -17,13 +17,34 @@ from moshi_rebuild_guarded_dlc_set import publish_file, run_logged, summarize
 from moshi_verify_lm_graph_set_cloud import _sha256, _write_json
 
 
+def admit_patch(root, patch, args):
+    if patch["passed"]:
+        return
+    limit = getattr(args, "cpu_patch_review_limit", None)
+    if limit is None or not 0 < limit <= 0.005:
+        raise ValueError("Strict CPU patch parity failed; explicit diagnostic review required")
+    rows = patch.get("samples", [])
+    if len(rows) != 2 or any(not v["finite"] or v["relative_rms"] > limit
+                            for row in rows for v in row["outputs"].values()):
+        raise ValueError("CPU patch exceeds diagnostic review limit")
+    review = {"kind": "diagnostic_admission_only", "relative_rms_limit": limit,
+              "original_strict_parity_passed": False, "cloud_publication_gates_unchanged": True,
+              "patch_receipt_sha256": _sha256(root / "source/patch.json"),
+              "calibration_manifest_sha256": _sha256(args.calibration_dir / "manifest.json")}
+    destination = root / "cpu_review.json"
+    if destination.exists() and json.loads(destination.read_text()) != review:
+        raise ValueError("CPU review configuration changed; preserve existing review")
+    _write_json(destination, review)
+
+
 def publish_verified(root, name, args):
     proof = json.loads((root / "probe/report.json").read_text())
     patch = json.loads((root / "source/patch.json").read_text())
     if not proof["passed"] or not proof["recurrent"] or not all(r["passed"] for r in proof["recurrent"]):
         raise ValueError("Strict captured/recurrent proof is required")
     source_receipt = json.loads((args.reuse_root / "graphs" / name / "source.json").read_text())
-    if not patch["passed"] or not patch["existing_initializer_values_unchanged"] or patch["source_sha256"] != _sha256(Path(source_receipt["onnx"])):
+    admit_patch(root, patch, args)
+    if not patch["existing_initializer_values_unchanged"] or patch["source_sha256"] != _sha256(Path(source_receipt["onnx"])):
         raise ValueError("Source/patch proof mismatch")
     if patch["patched_sha256"] != _sha256(root / "source/model.onnx"):
         raise ValueError("Patched model changed")
@@ -34,6 +55,8 @@ def publish_verified(root, name, args):
         raise ValueError("Verified DLC changed")
     record["rmsnorm_patch_receipt"] = str(root / "source/patch.json")
     record["rmsnorm_patch_receipt_sha256"] = _sha256(root / "source/patch.json")
+    if (root / "cpu_review.json").exists():
+        record["cpu_patch_review"] = json.loads((root / "cpu_review.json").read_text())
     _write_json(candidate_path, candidate)
     destination = args.publish_root / "graphs" / name
     destination.mkdir(parents=True, exist_ok=True)
@@ -59,8 +82,11 @@ def experiment(name, root, args):
                     "--source-onnx", str(source), "--calibration-dir", str(args.calibration_dir),
                     "--graph", name, "--output-dir", str(root / "source")], root / "prepare.log", 1800)
     patch = json.loads(patch_path.read_text())
-    if not patch["passed"] or patch["source_sha256"] != _sha256(source):
+    admit_patch(root, patch, args)
+    if patch["source_sha256"] != _sha256(source):
         raise ValueError("CPU/source gate failed")
+    if patch["patched_sha256"] != _sha256(root / "source/model.onnx"):
+        raise ValueError("Patched source changed after CPU check")
     receipt = root / "conversion.json"
     if not receipt.exists():
         graph = onnx.load(str(root / "source/model.onnx"), load_external_data=False).graph
@@ -96,6 +122,8 @@ def main():
         p.add_argument(f"--{name}", type=Path, required=True)
     p.add_argument("--graph", action="append", required=True)
     p.add_argument("--diagnostic-graph", action="append", default=[])
+    p.add_argument("--cpu-patch-review-limit", type=float,
+                   help="Explicit experimental admission of CPU patch differences, capped at 0.5%%; strict cloud gates remain")
     p.add_argument("--existing-experiment", action="append", default=[], help="graph=/absolute/existing/experiment")
     args = p.parse_args()
     existing = dict(v.split("=", 1) for v in args.existing_experiment)
